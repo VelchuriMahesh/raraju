@@ -36,12 +36,11 @@ export const Products: React.FC = () => {
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
 
-  // Form Fields (Simple & Clean: Image, Name, Packaging 25kg/50kg, Purchase Price, Selling Price)
+  // Form Fields (Simple & Clean: Image, Name, Packaging 25kg/50kg, Selling Price)
   const [name, setName] = useState('');
   const [sku, setSku] = useState('');
   const [unit, setUnit] = useState('25 kg');
   const [standardPrice, setStandardPrice] = useState('');
-  const [purchasePrice, setPurchasePrice] = useState('');
   const [imageUrl, setImageUrl] = useState('');
   const [isUploadingImage, setIsUploadingImage] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -65,7 +64,6 @@ export const Products: React.FC = () => {
     setSku(`SKU-${Date.now().toString().slice(-5)}`);
     setUnit('25 kg');
     setStandardPrice('');
-    setPurchasePrice('');
     setImageUrl('');
     setIsModalOpen(true);
   };
@@ -76,7 +74,6 @@ export const Products: React.FC = () => {
     setSku(prod.sku);
     setUnit(prod.unit || '25 kg');
     setStandardPrice(String(prod.standardPrice));
-    setPurchasePrice(prod.purchasePrice ? String(prod.purchasePrice) : '');
     setImageUrl(prod.imageUrl || '');
     setIsModalOpen(true);
   };
@@ -105,9 +102,10 @@ export const Products: React.FC = () => {
       error('Product name is required.');
       return;
     }
+
     const priceNum = parseFloat(standardPrice);
-    if (isNaN(priceNum) || priceNum <= 0) {
-      error('Please enter a valid standard selling price.');
+    if (isNaN(priceNum) || priceNum < 0) {
+      error('Please enter a valid selling price.');
       return;
     }
 
@@ -121,7 +119,6 @@ export const Products: React.FC = () => {
             sku: sku.trim() || editingProduct.sku,
             unit,
             standardPrice: priceNum,
-            purchasePrice: purchasePrice ? parseFloat(purchasePrice) : priceNum * 0.8,
             imageUrl: imageUrl || undefined
           },
           currentUser
@@ -135,7 +132,6 @@ export const Products: React.FC = () => {
             categoryId: 'cat_grains',
             categoryName: 'Grains & Rice',
             unit,
-            purchasePrice: purchasePrice ? parseFloat(purchasePrice) : priceNum * 0.8,
             standardPrice: priceNum,
             status: 'ACTIVE',
             imageUrl: imageUrl || undefined
@@ -207,7 +203,7 @@ export const Products: React.FC = () => {
             <span>Product Master Catalog / ఉత్పత్తుల జాబితా</span>
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Master list of products, packaging specifications, and standard selling prices / ఉత్పత్తులు మరియు ధరల వివరాలు
+            Master list of products, packaging specifications, and selling prices / ఉత్పత్తులు మరియు ధరల వివరాలు
           </p>
         </div>
 
@@ -238,7 +234,7 @@ export const Products: React.FC = () => {
         </span>
       </div>
 
-      {/* Products Table (Image, Name, Packaging, Purchase Price, Standard Selling Price, Status, Actions) */}
+      {/* Products Table (Image, Name, Packaging, Purchase Price, Selling Price, Status, Actions) */}
       <div className="bg-white border border-slate-200 rounded-3xl overflow-hidden shadow-sm">
         {loading ? (
           <div className="h-64 flex flex-col items-center justify-center gap-2 text-slate-400">
@@ -259,7 +255,6 @@ export const Products: React.FC = () => {
                   <th className="py-3.5 px-4">Product Image</th>
                   <th className="py-3.5 px-4">Product Name</th>
                   <th className="py-3.5 px-4">Packaging Unit</th>
-                  <th className="py-3.5 px-4 text-right">Purchase Price</th>
                   <th className="py-3.5 px-4 text-right">Selling Price</th>
                   <th className="py-3.5 px-4 text-center">Status</th>
                   <th className="py-3.5 px-4 text-right">Actions</th>
@@ -301,12 +296,7 @@ export const Products: React.FC = () => {
                       </span>
                     </td>
 
-                    {/* Purchase Price */}
-                    <td className="py-3.5 px-4 text-right font-mono text-slate-500 font-bold">
-                      {prod.purchasePrice ? `₹${prod.purchasePrice.toFixed(2)}` : '—'}
-                    </td>
-
-                    {/* Standard Selling Price */}
+                    {/* Selling Price */}
                     <td className="py-3.5 px-4 text-right font-mono font-black text-slate-900 text-sm">
                       ₹{prod.standardPrice.toFixed(2)}
                     </td>
@@ -474,38 +464,21 @@ export const Products: React.FC = () => {
                 />
               </div>
 
-              {/* Pricing Grid */}
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">
-                    Purchase Cost (₹) / కొనుగోలు ధర
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    step="any"
-                    value={purchasePrice}
-                    onChange={(e) => setPurchasePrice(e.target.value)}
-                    placeholder="e.g. 1300"
-                    className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl font-mono font-bold text-slate-900 focus:outline-none focus:border-indigo-500 focus:bg-white"
-                  />
-                </div>
-
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">
-                    Standard Selling Price (₹) * / అమ్మకపు ధర
-                  </label>
-                  <input
-                    type="number"
-                    required
-                    min="0"
-                    step="any"
-                    value={standardPrice}
-                    onChange={(e) => setStandardPrice(e.target.value)}
-                    placeholder="e.g. 1500"
-                    className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl font-mono font-black text-slate-900 focus:outline-none focus:border-indigo-500 focus:bg-white"
-                  />
-                </div>
+              {/* Selling Price */}
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">
+                  Selling Price (₹) * / అమ్మకపు ధర
+                </label>
+                <input
+                  type="number"
+                  required
+                  min="0"
+                  step="any"
+                  value={standardPrice}
+                  onChange={(e) => setStandardPrice(e.target.value)}
+                  placeholder="e.g. 1500"
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl font-mono font-black text-slate-900 focus:outline-none focus:border-indigo-500 focus:bg-white"
+                />
               </div>
 
               <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">

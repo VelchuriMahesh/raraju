@@ -99,7 +99,7 @@ export const CustomerRateModal: React.FC<CustomerRateModalProps> = ({
         {/* Pricing Info Box */}
         <div className="mt-4 p-4 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
           <div>
-            <p className="text-xs text-slate-400 font-medium">Standard Selling Price</p>
+            <p className="text-xs text-slate-400 font-medium">Selling Price</p>
             <p className="text-xl font-extrabold text-white font-mono">₹{standardPrice.toFixed(2)}</p>
           </div>
           <div className="text-right">
@@ -135,12 +135,12 @@ export const CustomerRateModal: React.FC<CustomerRateModalProps> = ({
                 {diff > 0 ? (
                   <span className="text-emerald-400 flex items-center gap-0.5">
                     <ArrowUpRight className="w-3.5 h-3.5" />
-                    +₹{diff.toFixed(2)} increase over standard price
+                    +₹{diff.toFixed(2)} increase over selling price
                   </span>
                 ) : (
                   <span className="text-rose-400 flex items-center gap-0.5">
                     <ArrowDownRight className="w-3.5 h-3.5" />
-                    -₹{Math.abs(diff).toFixed(2)} discount under standard price
+                    -₹{Math.abs(diff).toFixed(2)} discount under selling price
                   </span>
                 )}
               </div>

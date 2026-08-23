@@ -469,35 +469,23 @@ export const subscribeToSales = (
   // 3. Firestore live snapshot listener
   let unsubscribeFirestore = () => {};
   try {
-    let q = query(collection(db, SALES_COLLECTION), orderBy('createdAt', 'desc'));
-    if (storeIdFilter) {
-      q = query(
-        collection(db, SALES_COLLECTION),
-        where('storeId', '==', storeIdFilter),
-        orderBy('createdAt', 'desc')
-      );
-    }
-
     unsubscribeFirestore = onSnapshot(
-      q,
+      collection(db, SALES_COLLECTION),
       (snapshot) => {
         if (!snapshot.empty) {
           const raw = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Sale));
+          raw.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
           const firestoreSales = normalizeSalesData(raw);
-          const localOnly = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, [])).filter(
-            (ls) => !firestoreSales.some((fs) => fs.id === ls.id || fs.invoiceNumber === ls.invoiceNumber)
-          );
-          const merged = [...firestoreSales, ...localOnly];
-          setLocalData(SALES_COLLECTION, merged);
-          callback(storeIdFilter ? merged.filter((s) => s.storeId === storeIdFilter) : merged);
+          setLocalData(SALES_COLLECTION, firestoreSales);
+          callback(storeIdFilter ? firestoreSales.filter((s) => s.storeId === storeIdFilter) : firestoreSales);
         } else {
-          const local = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, INITIAL_SALES));
+          const local = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, []));
           callback(storeIdFilter ? local.filter((s) => s.storeId === storeIdFilter) : local);
         }
       },
       (error) => {
         console.warn('Firestore subscribeToSales notice:', error);
-        const local = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, INITIAL_SALES));
+        const local = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, []));
         callback(storeIdFilter ? local.filter((s) => s.storeId === storeIdFilter) : local);
       }
     );

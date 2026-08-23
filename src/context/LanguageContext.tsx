@@ -60,7 +60,7 @@ export const translations: Translations = {
   stock: { en: 'Stock', te: 'స్టాక్' },
   outOfStock: { en: 'OUT OF STOCK', te: 'స్టాక్ అయిపోయింది' },
   lowStock: { en: 'Low Stock', te: 'తక్కువ స్టాక్' },
-  standardPrice: { en: 'Standard Price', te: 'ప్రామాణిక ధర' },
+  standardPrice: { en: 'Selling Price', te: 'అమ్మకపు ధర' },
   customerRate: { en: 'Customer Rate', te: 'కస్టమర్ రేట్' },
   subtotal: { en: 'Subtotal', te: 'ఉప మొత్తం' },
   gst: { en: 'GST Tax', te: 'జీఎస్టీ పన్ను' },

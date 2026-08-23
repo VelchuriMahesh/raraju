@@ -29,8 +29,8 @@ export interface Product {
   brand?: string;
   description?: string;
   unit: ProductUnit;
-  purchasePrice: number;
-  standardPrice: number; // Standard selling price
+  purchasePrice?: number;
+  standardPrice: number; // Selling price
   gstRate?: number; // in percentage, e.g., 0, 5, 12, 18, 28
   hsnCode?: string;
   minStockAlert?: number; // Low stock threshold
