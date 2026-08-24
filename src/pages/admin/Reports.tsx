@@ -16,13 +16,17 @@ import {
   Layers,
   ChevronDown,
   CheckCircle2,
-  Printer
+  Printer,
+  Trash2,
+  AlertTriangle,
+  X
 } from 'lucide-react';
+import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { Sale } from '../../types/sale';
 import { Store } from '../../types/store';
-import { subscribeToSales } from '../../services/saleService';
+import { subscribeToSales, deleteSale } from '../../services/saleService';
 import { subscribeToStores } from '../../services/storeService';
 import { exportToCSV } from '../../services/reportService';
 import { generateInvoicePDF } from '../../services/pdfService';
@@ -31,11 +35,17 @@ export const Reports: React.FC = () => {
   const { success, error } = useToast();
   const { language, t } = useLanguage();
 
+  const { currentUser } = useAuth();
   const [sales, setSales] = useState<Sale[]>([]);
   const [stores, setStores] = useState<Store[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [storeFilter, setStoreFilter] = useState<string>('ALL');
   const [selectedDateFilter, setSelectedDateFilter] = useState<string>(''); // empty = all dates
+
+  // Permanent Delete Modal State
+  const [deletingSale, setDeletingSale] = useState<Sale | null>(null);
+  const [restoreStockOnDelete, setRestoreStockOnDelete] = useState<boolean>(true);
+  const [isDeleting, setIsDeleting] = useState<boolean>(false);
 
   // Denominations Calculator State
   const [denom500, setDenom500] = useState<number>(0);
@@ -44,6 +54,22 @@ export const Reports: React.FC = () => {
   const [denom50, setDenom50] = useState<number>(0);
   const [denom20, setDenom20] = useState<number>(0);
   const [denom10, setDenom10] = useState<number>(0);
+
+  const handleConfirmDelete = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!deletingSale || !currentUser) return;
+
+    setIsDeleting(true);
+    try {
+      await deleteSale(deletingSale.id, currentUser, restoreStockOnDelete);
+      success(`Invoice #${deletingSale.invoiceNumber} permanently deleted.`);
+      setDeletingSale(null);
+    } catch (err: any) {
+      error('Failed to delete invoice: ' + err.message);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
 
   useEffect(() => {
     const unsubSales = subscribeToSales((liveSales) => {
@@ -359,7 +385,7 @@ export const Reports: React.FC = () => {
                 <th className="py-3 px-4">Payment</th>
                 <th className="py-3 px-4 text-right">Extra Fee</th>
                 <th className="py-3 px-4 text-right">Grand Total</th>
-                <th className="py-3 px-4 text-center">Receipt</th>
+                <th className="py-3 px-4 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
@@ -432,18 +458,27 @@ export const Reports: React.FC = () => {
                     <td className="py-3 px-4 text-right font-mono font-black text-slate-900 text-sm">
                       ₹{sale.grandTotal.toFixed(2)}
                     </td>
-                    <td className="py-3 px-4 text-center">
-                      <button
-                        onClick={() => {
-                          const doc = generateInvoicePDF(sale, null, null, 'thermal');
-                          doc.save(`${sale.invoiceNumber}_thermal.pdf`);
-                          success(`Downloaded ${sale.invoiceNumber}`);
-                        }}
-                        className="p-1.5 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-indigo-50"
-                        title="Download Thermal PDF"
-                      >
-                        <FileText className="w-4 h-4" />
-                      </button>
+                    <td className="py-3 px-4 text-right">
+                      <div className="flex items-center justify-end gap-1.5">
+                        <button
+                          onClick={() => {
+                            const doc = generateInvoicePDF(sale, null, null, 'thermal');
+                            doc.save(`${sale.invoiceNumber}_thermal.pdf`);
+                            success(`Downloaded ${sale.invoiceNumber}`);
+                          }}
+                          className="p-1.5 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-colors"
+                          title="Download Thermal PDF Receipt"
+                        >
+                          <Printer className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => setDeletingSale(sale)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                          title="Permanently Delete Invoice (శాశ్వతంగా తొలగించు)"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))
@@ -452,6 +487,71 @@ export const Reports: React.FC = () => {
           </table>
         </div>
       </div>
+
+      {/* Permanent Delete Confirmation Modal */}
+      {deletingSale && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-fade-in">
+          <div className="bg-white border border-slate-200 rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-4 animate-scale-up text-xs">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center font-bold">
+                  <Trash2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-sm text-slate-900">
+                    Permanently Delete Invoice #{deletingSale.invoiceNumber}
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    {deletingSale.storeName} • ₹{deletingSale.grandTotal.toFixed(2)} ({deletingSale.paymentMethod})
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setDeletingSale(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-slate-600 leading-relaxed">
+              Are you sure you want to permanently delete this transaction from the financial report? This action cannot be undone.
+            </p>
+
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="restoreStockReportDeleteCheck"
+                checked={restoreStockOnDelete}
+                onChange={(e) => setRestoreStockOnDelete(e.target.checked)}
+                className="w-4 h-4 text-indigo-600 rounded"
+              />
+              <label htmlFor="restoreStockReportDeleteCheck" className="text-slate-800 font-bold cursor-pointer">
+                Restore sold items back to store stock (స్టాక్ తిరిగి చేర్చు)
+              </label>
+            </div>
+
+            <form onSubmit={handleConfirmDelete} className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setDeletingSale(null)}
+                disabled={isDeleting}
+                className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isDeleting}
+                className="px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-extrabold rounded-xl shadow-lg shadow-rose-600/20 disabled:opacity-50 flex items-center gap-1.5"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>{isDeleting ? 'Deleting...' : 'Confirm Delete (శాశ్వతంగా తొలగించు)'}</span>
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

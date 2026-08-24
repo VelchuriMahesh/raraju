@@ -187,8 +187,8 @@ export const AppContent: React.FC = () => {
             />
 
             {/* Admin Convenience Shortcuts */}
-            <Route path="/" element={<Navigate to="/admin/dashboard" replace />} />
-            <Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} />
+            <Route path="/" element={<Navigate to="/admin/stock-assignment" replace />} />
+            <Route path="/admin" element={<Navigate to="/admin/stock-assignment" replace />} />
             <Route path="/dashboard" element={<Navigate to="/admin/dashboard" replace />} />
             <Route path="/stores" element={<Navigate to="/admin/stores" replace />} />
             <Route path="/products" element={<Navigate to="/admin/products" replace />} />
@@ -203,7 +203,7 @@ export const AppContent: React.FC = () => {
             <Route path="/settings" element={<Navigate to="/admin/settings" replace />} />
 
             {/* Fallback for Admin */}
-            <Route path="*" element={<Navigate to="/admin/dashboard" replace />} />
+            <Route path="*" element={<Navigate to="/admin/stock-assignment" replace />} />
           </>
         ) : (
           /* Store Staff fallbacks */
