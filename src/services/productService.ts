@@ -11,7 +11,7 @@ import {
   orderBy,
   onSnapshot
 } from 'firebase/firestore';
-import { db } from './firebase';
+import { db, stripUndefined } from './firebase';
 import { Product, Category, ProductStatus } from '../types/product';
 import { logAudit } from './auditService';
 import { UserProfile } from '../types/auth';
@@ -182,10 +182,11 @@ export const createProduct = async (
     updatedAt: now
   };
 
+  let cloudError: any = null;
   try {
     const ref = doc(collection(db, PRODUCTS_COLLECTION));
     newProduct.id = ref.id;
-    await setDoc(ref, newProduct);
+    await setDoc(ref, stripUndefined(newProduct));
 
     await logAudit(
       adminUser.id,
@@ -196,13 +197,21 @@ export const createProduct = async (
       `Created product "${newProduct.name}" (SKU: ${newProduct.sku})`,
       { entityId: newProduct.id, newValue: newProduct }
     );
-  } catch (error) {
-    console.warn('Firestore createProduct notice, saving to local cache:', error);
+  } catch (error: any) {
+    console.error('Firestore createProduct FAILED (cloud not updated):', error);
+    cloudError = error;
   }
 
   const prods = getLocalData<Product[]>(PRODUCTS_COLLECTION, INITIAL_PRODUCTS);
   const updated = [newProduct, ...prods.filter((p) => p.id !== newProduct.id)];
   setLocalData(PRODUCTS_COLLECTION, updated);
+
+  // A product saved only to this browser never reaches the store's POS catalog.
+  if (cloudError) {
+    throw new Error(
+      `Could not save the product to the cloud (${cloudError.code || 'error'}: ${cloudError.message || cloudError}).`
+    );
+  }
 
   return newProduct;
 };
@@ -212,17 +221,18 @@ export const updateProduct = async (
   updates: Partial<Product>,
   adminUser: UserProfile
 ): Promise<void> => {
+  let cloudError: any = null;
   try {
     const ref = doc(db, PRODUCTS_COLLECTION, productId);
     const oldSnap = await getDoc(ref);
     const oldData = oldSnap.exists() ? oldSnap.data() : null;
 
-    const dataToUpdate = {
+    const dataToUpdate = stripUndefined({
       ...updates,
       updatedAt: new Date().toISOString()
-    };
+    });
 
-    await updateDoc(ref, dataToUpdate);
+    await setDoc(ref, dataToUpdate, { merge: true });
 
     await logAudit(
       adminUser.id,
@@ -233,8 +243,9 @@ export const updateProduct = async (
       `Updated product "${updates.name || oldData?.name || productId}"`,
       { entityId: productId, oldValue: oldData, newValue: updates }
     );
-  } catch (error) {
-    console.warn(`Firestore updateProduct notice (${productId}), updating local cache:`, error);
+  } catch (error: any) {
+    console.error(`Firestore updateProduct FAILED (${productId}):`, error);
+    cloudError = error;
   }
 
   const prods = getLocalData<Product[]>(PRODUCTS_COLLECTION, INITIAL_PRODUCTS);
@@ -242,6 +253,12 @@ export const updateProduct = async (
     p.id === productId ? { ...p, ...updates, updatedAt: new Date().toISOString() } : p
   );
   setLocalData(PRODUCTS_COLLECTION, updated);
+
+  if (cloudError) {
+    throw new Error(
+      `Could not save the product changes to the cloud (${cloudError.code || 'error'}: ${cloudError.message || cloudError}).`
+    );
+  }
 };
 
 export const toggleProductStatus = async (
@@ -256,6 +273,7 @@ export const deleteProduct = async (
   productId: string,
   adminUser: UserProfile
 ): Promise<void> => {
+  let cloudError: any = null;
   try {
     const ref = doc(db, PRODUCTS_COLLECTION, productId);
     const oldSnap = await getDoc(ref);
@@ -272,11 +290,18 @@ export const deleteProduct = async (
       `Permanently deleted product "${oldData?.name || productId}"`,
       { entityId: productId, oldValue: oldData }
     );
-  } catch (error) {
-    console.warn(`Firestore deleteProduct notice (${productId}), updating local cache:`, error);
+  } catch (error: any) {
+    console.error(`Firestore deleteProduct FAILED (${productId}):`, error);
+    cloudError = error;
   }
 
   const prods = getLocalData<Product[]>(PRODUCTS_COLLECTION, INITIAL_PRODUCTS);
   const updated = prods.filter((p) => p.id !== productId);
   setLocalData(PRODUCTS_COLLECTION, updated);
+
+  if (cloudError) {
+    throw new Error(
+      `Could not delete the product in the cloud (${cloudError.code || 'error'}: ${cloudError.message || cloudError}).`
+    );
+  }
 };

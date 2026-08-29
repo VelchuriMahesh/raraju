@@ -13,8 +13,6 @@ export interface DailyStockAssignment {
   remainingQuantity: number; // assignedQuantity - soldQuantity
   assignedByUserId: string;
   assignedByUserName: string;
-  cloudSynced?: boolean;
-  syncError?: string;
   notes?: string;
   createdAt: string;
   updatedAt: string;

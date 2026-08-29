@@ -5,31 +5,111 @@ import { Product } from '../../types/product';
 import { Sale, PaymentMethod, SplitPaymentDetail, SaleCustomerInfo } from '../../types/sale';
 import { subscribeToProducts, getProducts } from '../../services/productService';
 import {
+  subscribeToDailyAssignments,
+  getDailyAssignments,
+  normalizeDateString,
+  getTodayDateString
+} from '../../services/stockAssignmentService';
+import {
+  subscribeToAllInventory,
+  getAllInventory,
   subscribeToStoreInventory,
   getStoreInventory
 } from '../../services/inventoryService';
+import { subscribeToStores, getStores } from '../../services/storeService';
 import { completeSaleTransaction } from '../../services/saleService';
 import { ProductGrid } from '../../components/pos/ProductGrid';
 import { Cart, CartItem } from '../../components/pos/Cart';
 import { PaymentModal } from '../../components/pos/PaymentModal';
 import { InvoiceSuccessModal } from '../../components/pos/InvoiceSuccessModal';
 import { Loader2, RefreshCw, AlertTriangle, Store as StoreIcon } from 'lucide-react';
+import { getLocalData, setLocalData, INITIAL_PRODUCTS, INITIAL_INVENTORIES } from '../../services/fallbackData';
+import { Store } from '../../types/store';
+import { DailyStockAssignment } from '../../types/stockAssignment';
 import { StoreInventory } from '../../types/inventory';
-import { auth, firebaseProjectId } from '../../services/firebase';
+import { collection, getDocs, onSnapshot, query, where } from 'firebase/firestore';
+import { db } from '../../services/firebase';
+
+const parseTimestamp = (val?: string): number => {
+  if (!val) return 0;
+  if (/^\d{2}-\d{2}-\d{4}/.test(val)) {
+    const parts = val.split('-');
+    return new Date(`${parts[2]}-${parts[1]}-${parts[0]}`).getTime() || 0;
+  }
+  const t = new Date(val).getTime();
+  return isNaN(t) ? 0 : t;
+};
 
 export const POS: React.FC = () => {
-  const { currentUser } = useAuth();
+  const { currentUser, isAdmin } = useAuth();
   const { success, error, warning } = useToast();
 
-  const storeId = currentUser?.storeId || '';
-  const storeName = currentUser?.storeName || 'Store Branch';
+  const [resolvedStore, setResolvedStore] = useState<Store | null>(() => {
+    const localStores = getLocalData<Store[]>('stores', []);
+    return (
+      localStores.find((s) => s.id === currentUser?.storeId) ||
+      localStores.find(
+        (s) => s.code?.toLowerCase() === currentUser?.storeId?.toLowerCase()
+      ) ||
+      localStores.find(
+        (s) => s.loginEmail?.toLowerCase() === currentUser?.email?.toLowerCase()
+      ) ||
+      localStores.find((s) => s.name?.toLowerCase().includes('krupa')) ||
+      localStores[0] ||
+      null
+    );
+  });
 
-  const [products, setProducts] = useState<Product[]>([]);
-  const [inventoryList, setInventoryList] = useState<StoreInventory[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const liveStores = await getStores();
+        if (cancelled) return;
+        const match =
+          liveStores.find((s) => s.id === currentUser?.storeId) ||
+          liveStores.find(
+            (s) => s.code?.toLowerCase() === currentUser?.storeId?.toLowerCase()
+          ) ||
+          liveStores.find(
+            (s) => s.loginEmail?.toLowerCase() === currentUser?.email?.toLowerCase()
+          ) ||
+          liveStores.find((s) => s.name?.toLowerCase().includes('krupa')) ||
+          liveStores[0] ||
+          null;
+        setResolvedStore(match);
+        console.log('[POS STORE RESOLUTION]', {
+          currentUserStoreId: currentUser?.storeId,
+          matchedStoreId: match?.id,
+          matchedStoreName: match?.name
+        });
+      } catch (e) {
+        console.error('[POS STORE RESOLUTION ERROR]', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser?.storeId, currentUser?.email]);
+
+  const storeId = resolvedStore?.id || currentUser?.storeId || '';
+  const storeName = resolvedStore?.name || currentUser?.storeName || 'krupa';
+
+  // Synchronous initial cache loads for zero-latency frame 1 rendering
+  const [products, setProducts] = useState<Product[]>(() =>
+    getLocalData<Product[]>('products', [])
+  );
+  const [assignments, setAssignments] = useState<DailyStockAssignment[]>(() =>
+    getLocalData<DailyStockAssignment[]>('dailyStockAssignments', [])
+  );
+  const [inventoryList, setInventoryList] = useState<StoreInventory[]>(() =>
+    getLocalData<StoreInventory[]>('inventory', [])
+  );
+
   const [cart, setCart] = useState<CartItem[]>([]);
   const [extraAmount, setExtraAmount] = useState<number>(0);
   const [extraAmountReason, setExtraAmountReason] = useState<string>('');
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState<boolean>(false);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [firestoreError, setFirestoreError] = useState<string | null>(null);
 
@@ -38,92 +118,139 @@ export const POS: React.FC = () => {
   const [completedSale, setCompletedSale] = useState<Sale | null>(null);
   const [isProcessingSale, setIsProcessingSale] = useState<boolean>(false);
 
+  const todayDate = useMemo(() => new Date().toISOString().split('T')[0], []);
+
   const inventoryMap = useMemo(() => {
-    const liveInventoryByProduct = new Map<string, number>();
-    inventoryList.forEach((item) => {
-      liveInventoryByProduct.set(item.productId, Math.max(0, Number(item.quantity) || 0));
+    const map: { [productId: string]: number } = {};
+    const normToday = normalizeDateString(todayDate);
+
+    products.forEach((prod) => {
+      const dsaMatches = assignments.filter((a) => {
+        if (!a) return false;
+        const storeMatch =
+          a.storeId === storeId ||
+          (resolvedStore?.id && a.storeId === resolvedStore.id) ||
+          (resolvedStore?.code && a.storeCode?.toLowerCase() === resolvedStore.code.toLowerCase()) ||
+          (resolvedStore?.name && a.storeName?.toLowerCase().trim() === resolvedStore.name.toLowerCase().trim()) ||
+          (currentUser?.storeId && a.storeId?.toLowerCase() === currentUser.storeId.toLowerCase()) ||
+          (currentUser?.storeName && a.storeName?.toLowerCase() === currentUser.storeName.toLowerCase());
+
+        const dateMatch =
+          !a.date ||
+          a.date === todayDate ||
+          normalizeDateString(a.date) === normToday;
+
+        const prodMatch =
+          a.productId === prod.id ||
+          (a.sku && prod.sku && a.sku.toLowerCase().trim() === prod.sku.toLowerCase().trim()) ||
+          (a.productName && prod.name && a.productName.toLowerCase().trim() === prod.name.toLowerCase().trim());
+
+        return storeMatch && dateMatch && prodMatch;
+      });
+
+      let dsaStock: number | null = null;
+      if (dsaMatches.length > 0) {
+        dsaMatches.sort((a, b) => {
+          const timeA = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+          const timeB = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+          return timeB - timeA;
+        });
+        const match = dsaMatches[0];
+        dsaStock = match.remainingQuantity !== undefined ? match.remainingQuantity : match.assignedQuantity;
+      }
+
+      const invMatch = inventoryList.find((i) => {
+        if (!i) return false;
+        const storeMatch =
+          i.storeId === storeId ||
+          (resolvedStore?.id && i.storeId === resolvedStore.id) ||
+          (currentUser?.storeId && i.storeId?.toLowerCase() === currentUser.storeId.toLowerCase());
+        const prodMatch =
+          i.productId === prod.id ||
+          (i.sku && prod.sku && i.sku.toLowerCase().trim() === prod.sku.toLowerCase().trim());
+        return storeMatch && prodMatch;
+      });
+      const invStock = invMatch?.quantity ?? null;
+
+      const resolvedQty = dsaStock !== null ? dsaStock : invStock !== null ? invStock : 0;
+      map[prod.id] = Math.max(0, Number(resolvedQty) || 0);
     });
 
-    const map: { [productId: string]: number } = {};
-    products.forEach((prod) => {
-      map[prod.id] = liveInventoryByProduct.get(prod.id) ?? 0;
+    console.log('[POS INVENTORY FINAL STATE]', {
+      storeId,
+      storeName,
+      todayDate,
+      stockMap: map,
+      assignmentsCount: assignments.length,
+      assignments
     });
 
     return map;
-  }, [products, inventoryList]);
-
-  useEffect(() => {
-    if (!storeId) return;
-
-    console.info('[STORE POS READ]', {
-      firebaseProject: firebaseProjectId,
-      authenticatedUid: auth.currentUser?.uid || currentUser?.id,
-      storeId,
-      listener: 'CONNECTED',
-      inventoryRows: inventoryList.map((item) => ({
-        productId: item.productId,
-        firestoreQuantity: item.quantity
-      }))
-    });
-  }, [storeId, inventoryList, currentUser?.id]);
+  }, [products, assignments, inventoryList, storeId, storeName, todayDate, resolvedStore, currentUser]);
 
   const refreshData = useCallback(async () => {
-    if (!storeId) {
-      setFirestoreError('This store user is not assigned to a canonical store ID.');
-      setLoading(false);
-      return;
+    if (!storeId) return;
+    try {
+      setFirestoreError(null);
+      const liveAssignments = await getDailyAssignments(todayDate, storeId);
+      setAssignments(liveAssignments);
+      // NOTE: do not setLocalData here. getDailyAssignments already caches the full
+      // collection; writing this store/date-filtered subset back used to erase every
+      // other row from the shared cache (and wiped it entirely when the query was empty).
+    } catch (e: any) {
+      console.error('[POS INVENTORY FETCH ERROR]', e);
+      if (e?.code === 'permission-denied') {
+        setFirestoreError('Database permission denied: Unable to access store inventory.');
+      }
     }
 
     try {
-      setFirestoreError(null);
-      const [liveInventory, liveProducts] = await Promise.all([
-        getStoreInventory(storeId),
-        getProducts(true)
+      const liveInvs = await getStoreInventory(storeId);
+      setInventoryList(liveInvs);
+      // Merge (never replace) so this store's rows do not evict other stores' cache entries.
+      const cachedInvs = getLocalData<StoreInventory[]>('inventory', []);
+      setLocalData('inventory', [
+        ...liveInvs,
+        ...cachedInvs.filter((c) => !liveInvs.some((l) => l.id === c.id))
       ]);
-      setInventoryList(liveInventory);
-      setProducts(liveProducts);
-    } catch (e: any) {
-      console.error('[POS FIRESTORE REFRESH ERROR]', e);
-      setFirestoreError(e?.message || 'Unable to read live store inventory from Firestore.');
-    } finally {
-      setLoading(false);
+    } catch (e) {
+      console.error('[POS INVENTORY DOCS ERROR]', e);
     }
-  }, [storeId]);
+
+    try {
+      const prodsSnap = await getProducts(true);
+      if (prodsSnap && prodsSnap.length > 0) setProducts(prodsSnap);
+    } catch (e) {}
+  }, [storeId, todayDate]);
 
   useEffect(() => {
-    if (!storeId) {
-      setFirestoreError('This store user is not assigned to a canonical store ID.');
-      setLoading(false);
-      return () => {};
-    }
+    const unsubProds = subscribeToProducts((liveProds) => setProducts(liveProds), true);
 
-    setLoading(true);
-    setFirestoreError(null);
-
-    const unsubProds = subscribeToProducts((liveProds) => {
-      setProducts(liveProds);
-      setLoading(false);
-    }, true);
-
-    const unsubInvs = subscribeToStoreInventory(
-      storeId,
+    // Scope the live feed to THIS store and TODAY, otherwise the cashier's stock map is
+    // built from every store's and every date's assignment rows.
+    const unsubAssignments = subscribeToDailyAssignments(
       (items) => {
-        setInventoryList(items);
-        setLoading(false);
+        setAssignments(items);
       },
-      (err) => {
-        setFirestoreError(err.message || 'Unable to subscribe to live store inventory.');
-        setLoading(false);
-      }
+      todayDate,
+      storeId || undefined
     );
+
+    let unsubInvs = () => {};
+    if (storeId) {
+      unsubInvs = subscribeToStoreInventory(storeId, (items) => {
+        setInventoryList(items);
+      });
+    }
 
     refreshData();
 
     return () => {
       unsubProds();
+      unsubAssignments();
       unsubInvs();
     };
-  }, [storeId, refreshData]);
+  }, [storeId, todayDate, refreshData]);
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
@@ -135,7 +262,8 @@ export const POS: React.FC = () => {
   };
 
   const handleAddToCart = (product: Product) => {
-    const availableStock = inventoryMap[product.id] ?? 0;
+    const recordedStock = inventoryMap[product.id];
+    const availableStock = recordedStock !== undefined ? recordedStock : 0;
 
     if (availableStock <= 0) {
       warning(`Product "${product.name}" has 0 stock available. Please assign stock in Daily Stock Assign.`);
@@ -208,14 +336,6 @@ export const POS: React.FC = () => {
       error('User session not active.');
       return;
     }
-    if (!storeId) {
-      error('This store user is not assigned to a canonical store ID.');
-      return;
-    }
-    if (cart.length === 0) {
-      warning('Cart is empty.');
-      return;
-    }
 
     setIsProcessingSale(true);
     try {
@@ -248,6 +368,32 @@ export const POS: React.FC = () => {
       setCart([]);
       setExtraAmount(0);
       setExtraAmountReason('');
+
+      // Deduct sold quantity from local assignments state immediately
+      setAssignments((prev) =>
+        prev.map((a) => {
+          const soldItem = cart.find((c) => c.product.id === a.productId);
+          if (soldItem) {
+            const sold = (a.soldQuantity || 0) + soldItem.quantity;
+            const remaining = Math.max(0, a.assignedQuantity - sold);
+            return { ...a, soldQuantity: sold, remainingQuantity: remaining };
+          }
+          return a;
+        })
+      );
+
+      // Deduct sold quantity from local inventory list immediately
+      setInventoryList((prev) =>
+        prev.map((i) => {
+          const soldItem = cart.find((c) => c.product.id === i.productId);
+          if (soldItem) {
+            const newQty = Math.max(0, i.quantity - soldItem.quantity);
+            return { ...i, quantity: newQty };
+          }
+          return i;
+        })
+      );
+
       success(`Sale completed successfully! Invoice #${sale.invoiceNumber}`);
     } catch (err: any) {
       console.error('Checkout error:', err);
@@ -294,7 +440,7 @@ export const POS: React.FC = () => {
           <div className="flex items-center gap-2">
             <div className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-50 border border-indigo-100 rounded-xl text-indigo-700 font-bold text-xs">
               <StoreIcon className="w-3.5 h-3.5" />
-              <span>Store: {storeName} ({storeId || 'Unassigned'})</span>
+              <span>Store: {storeName || 'Store Branch'} ({resolvedStore?.code || 'S1'})</span>
             </div>
 
             <span className="text-[11px] font-bold text-slate-500 hidden sm:inline">

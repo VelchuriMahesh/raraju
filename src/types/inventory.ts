@@ -14,16 +14,11 @@ export type StockMovementType =
 export interface StoreInventory {
   id: string; // Composite key: `${storeId}_${productId}`
   storeId: string;
-  storeName?: string;
-  storeCode?: string;
   productId: string;
   productName: string;
   sku: string;
-  unit?: string;
   quantity: number;
   lastPurchasePrice?: number;
-  reorderPoint?: number;
-  idealStockLevel?: number;
   updatedAt: string;
 }
 

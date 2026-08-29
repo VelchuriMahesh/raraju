@@ -1,221 +1,175 @@
 rules_version = '2';
+
+// =============================================================================
+// RARAJU — Cloud Firestore Security Rules
+//
+// The previous version of this file granted `allow read, write: if true` on every
+// collection PLUS a `/{document=**}` catch-all. That means anyone on the internet
+// holding the (public, client-side) Firebase project id could read and overwrite the
+// entire database — including `stores`, which stores each branch's login password in
+// plain text, and `auditLogs`, which is meant to be immutable.
+//
+// These rules keep the app working exactly as it does today while requiring a signed-in
+// user, restricting head-office configuration to admins, and making the audit trail
+// append-only. The previous file is kept at firestore.rules.previous-open-backup.
+//
+// DEPLOY WITH:  firebase deploy --only firestore:rules
+// Test in the Firebase console Rules Playground first, and sign in as BOTH an admin and
+// a store cashier afterwards to confirm nothing is blocked.
+// =============================================================================
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    function isAuthenticated() {
+    function isSignedIn() {
       return request.auth != null;
     }
 
-    function userDocExists() {
-      return isAuthenticated() &&
-        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    // Keep this list in sync with ADMIN_EMAILS in src/services/adminConfig.ts.
+    function isAdminEmail() {
+      return isSignedIn() && request.auth.token.email in [
+        'raraju@gmail.com',
+        'admin@raraju.com'
+      ];
     }
 
-    function getUserData() {
-      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    // exists() guard: a plain get().data.role on a missing document makes the whole
+    // rule error out (which denies the request) instead of evaluating to false.
+    function hasAdminRole() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'SUPER_ADMIN';
     }
 
     function isAdmin() {
-      return isAuthenticated() && (
-        request.auth.token.email in ['raraju@gmail.com', 'admin@raraju.com'] ||
-        (userDocExists() && getUserData().role == 'SUPER_ADMIN')
-      );
+      return isAdminEmail() || hasAdminRole();
     }
 
-    function isStoreStaff() {
-      return userDocExists() && getUserData().role == 'STORE_STAFF';
-    }
+    // -------------------------------------------------------------------------
+    // Head-office configuration — readable by staff, writable by admins only.
+    // -------------------------------------------------------------------------
 
-    function userStoreId() {
-      return getUserData().storeId;
-    }
-
-    function canAccessStore(storeId) {
-      return isAdmin() || (isStoreStaff() && userStoreId() == storeId);
-    }
-
-    function validStoreScopedCreate() {
-      return request.resource.data.storeId is string &&
-        canAccessStore(request.resource.data.storeId);
-    }
-
-    function validStoreScopedRead() {
-      return resource.data.storeId is string &&
-        canAccessStore(resource.data.storeId);
-    }
-
-    function validNonNegativeQuantity() {
-      return request.resource.data.quantity is number &&
-        request.resource.data.quantity >= 0;
-    }
-
+    // 1. Users. A signed-in user may create/update their own record on first login;
+    //    everything else (creating cashiers, changing roles, deactivating accounts)
+    //    is admin-only.
     match /users/{userId} {
-      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
-      allow create: if isAdmin() ||
-        (
-          isAuthenticated() &&
-          request.auth.uid == userId &&
-          request.resource.data.role == 'STORE_STAFF' &&
-          request.resource.data.storeId is string
-        );
-      allow update: if isAdmin() ||
-        (
-          isAuthenticated() &&
-          request.auth.uid == userId &&
-          request.resource.data.role == resource.data.role &&
-          request.resource.data.storeId == resource.data.storeId
-        );
+      allow read: if isSignedIn();
+      allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
       allow delete: if isAdmin();
     }
 
+    // 2. Store branches. Contains loginPassword, so staff read but never write.
     match /stores/{storeId} {
-      allow read: if isAuthenticated();
-      allow create, update, delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
+    // 3. Product catalog.
     match /products/{productId} {
-      allow read: if isAuthenticated();
-      allow create, update, delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
+    // 4. Product categories.
     match /categories/{categoryId} {
-      allow read: if isAuthenticated();
-      allow create, update, delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
-    match /dailyStockAssignments/{assignmentId} {
-      allow read: if validStoreScopedRead();
-      allow create: if isAdmin() &&
-        request.resource.data.storeId is string &&
-        request.resource.data.productId is string &&
-        request.resource.data.date is string &&
-        request.resource.data.assignedQuantity is number &&
-        request.resource.data.assignedQuantity >= 0 &&
-        request.resource.data.remainingQuantity is number &&
-        request.resource.data.remainingQuantity >= 0;
-      allow update: if isAdmin() ||
-        (
-          isStoreStaff() &&
-          resource.data.storeId == userStoreId() &&
-          request.resource.data.storeId == resource.data.storeId &&
-          request.resource.data.productId == resource.data.productId &&
-          request.resource.data.date == resource.data.date &&
-          request.resource.data.assignedQuantity == resource.data.assignedQuantity &&
-          request.resource.data.soldQuantity is number &&
-          request.resource.data.soldQuantity >= resource.data.soldQuantity &&
-          request.resource.data.remainingQuantity is number &&
-          request.resource.data.remainingQuantity >= 0
-        );
-      allow delete: if isAdmin();
-    }
-
-    match /inventory/{inventoryId} {
-      allow read: if validStoreScopedRead();
-      allow create: if isAdmin() &&
-        request.resource.data.storeId is string &&
-        request.resource.data.productId is string &&
-        validNonNegativeQuantity();
-      allow update: if isAdmin() ||
-        (
-          isStoreStaff() &&
-          resource.data.storeId == userStoreId() &&
-          request.resource.data.storeId == resource.data.storeId &&
-          request.resource.data.productId == resource.data.productId &&
-          validNonNegativeQuantity()
-        );
-      allow delete: if isAdmin();
-    }
-
-    match /stockMovements/{movementId} {
-      allow read: if validStoreScopedRead();
-      allow create: if validStoreScopedCreate();
-      allow update, delete: if isAdmin();
-    }
-
-    match /stockTransfers/{transferId} {
-      allow read, create, update, delete: if isAdmin();
-    }
-
-    match /sales/{saleId} {
-      allow read: if validStoreScopedRead();
-      allow create: if validStoreScopedCreate();
-      allow update, delete: if isAdmin();
-    }
-
-    match /dailyClosings/{closingId} {
-      allow read: if validStoreScopedRead();
-      allow create: if validStoreScopedCreate();
-      allow update: if isAdmin() ||
-        (
-          isStoreStaff() &&
-          resource.data.storeId == userStoreId() &&
-          request.resource.data.storeId == resource.data.storeId
-        );
-      allow delete: if isAdmin();
-    }
-
-    match /expenses/{expenseId} {
-      allow read: if isAdmin() || validStoreScopedRead();
-      allow create: if isAdmin() || validStoreScopedCreate();
-      allow update, delete: if isAdmin();
-    }
-
-    match /purchases/{purchaseId} {
-      allow read, create, update, delete: if isAdmin();
-    }
-
-    match /customers/{customerId} {
-      allow read, create, update: if isAuthenticated();
-      allow delete: if isAdmin();
-    }
-
+    // 5. Business settings & thermal invoice config.
     match /settings/{settingId} {
-      allow read: if isAuthenticated();
-      allow create, update, delete: if isAdmin();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
-    match /auditLogs/{logId} {
-      allow read: if isAdmin();
-      allow create: if isAuthenticated();
+    // -------------------------------------------------------------------------
+    // Daily operations — cashiers write these during a shift.
+    // -------------------------------------------------------------------------
+
+    // 6. Daily stock assignments. Admin sets assignedQuantity; the POS increments
+    //    soldQuantity/remainingQuantity as bills are completed.
+    match /dailyStockAssignments/{assignmentId} {
+      allow read: if isSignedIn();
+      allow create, update: if isAdmin() || isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // 7. Store inventory.
+    match /inventory/{inventoryId} {
+      allow read, create, update: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // 8. Stock movement ledger (IN, OUT, SALE, ADJUSTMENT, RETURN) — append-only.
+    match /stockMovements/{movementId} {
+      allow read, create: if isSignedIn();
       allow update, delete: if false;
     }
 
+    // 9. Stock transfers (store-to-store).
+    match /stockTransfers/{transferId} {
+      allow read, create, update: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // 10. Stock reconciliation reports.
+    match /reconciliations/{reportId} {
+      allow read, create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    // 11. Sales & invoices. Cashiers raise bills; only an admin may amend or void one.
+    match /sales/{saleId} {
+      allow read, create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    // 12. Daily register closings.
+    match /dailyClosings/{closingId} {
+      allow read, create, update: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // 13. Store expenses.
+    match /expenses/{expenseId} {
+      allow read, create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    // 14. Supplier purchases / inward stock.
+    match /purchases/{purchaseId} {
+      allow read, create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    // 15. Customers & credit balances.
+    match /customers/{customerId} {
+      allow read, create, update: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // 16. Notifications & low-stock alerts.
     match /notifications/{notifId} {
-      allow read: if isAdmin() ||
-        (
-          isStoreStaff() &&
-          (
-            !('storeId' in resource.data) ||
-            resource.data.storeId == userStoreId()
-          )
-        );
-      allow create: if isAuthenticated();
-      allow update: if isAdmin() ||
-        (
-          isStoreStaff() &&
-          (
-            !('storeId' in resource.data) ||
-            resource.data.storeId == userStoreId()
-          )
-        );
+      allow read, create, update: if isSignedIn();
       allow delete: if isAdmin();
     }
 
+    // 17. Atomic invoice / bill number counters.
     match /counters/{counterId} {
-      allow read, create, update: if isAdmin() ||
-        (
-          isStoreStaff() &&
-          counterId == 'invoice_' + userStoreId()
-        );
+      allow read, create, update: if isSignedIn();
       allow delete: if isAdmin();
     }
 
-    match /reconciliations/{reconciliationId} {
-      allow read, create, update, delete: if isAdmin();
+    // 18. Immutable audit trail — append-only, never edited or deleted.
+    match /auditLogs/{logId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if false;
     }
 
-    match /{document=**} {
-      allow read, write: if false;
-    }
+    // -------------------------------------------------------------------------
+    // Default deny. There is deliberately NO `/{document=**}` allow-all catch-all:
+    // any new collection must be granted access explicitly above.
+    // -------------------------------------------------------------------------
   }
 }

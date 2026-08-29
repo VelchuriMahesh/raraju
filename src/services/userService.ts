@@ -9,10 +9,11 @@ import {
   where,
   orderBy
 } from 'firebase/firestore';
-import { db } from './firebase';
+import { db, stripUndefined } from './firebase';
 import { UserProfile, UserRole, UserStatus } from '../types/auth';
 import { logAudit } from './auditService';
 import { getLocalData, setLocalData } from './fallbackData';
+import { isAdminEmail } from './adminConfig';
 
 const USERS_COLLECTION = 'users';
 
@@ -53,11 +54,9 @@ const INITIAL_USERS: UserProfile[] = [
 
 export const normalizeUserProfile = (id: string, rawData: any): UserProfile => {
   const email = (rawData.email || '').toLowerCase().trim();
-  const isAdmin =
-    rawData.role === 'SUPER_ADMIN' ||
-    email === 'raraju@gmail.com' ||
-    email.includes('admin') ||
-    email === 'admin@raraju.com';
+  // Exact match only. `email.includes('admin')` used to promote any cashier whose
+  // address contained the word (e.g. "admin.krupa@...") to full head-office access.
+  const isAdmin = rawData.role === 'SUPER_ADMIN' || isAdminEmail(email);
 
   const role: UserRole = isAdmin ? 'SUPER_ADMIN' : (rawData.role as UserRole) || 'STORE_STAFF';
   const fullName = rawData.fullName || rawData.name || rawData.displayName || (isAdmin ? 'Admin' : 'Store Staff');
@@ -81,18 +80,19 @@ export const normalizeUserProfile = (id: string, rawData: any): UserProfile => {
 
 export const getUsers = async (storeIdFilter?: string): Promise<UserProfile[]> => {
   try {
-    let q = query(collection(db, USERS_COLLECTION), orderBy('createdAt', 'desc'));
-    if (storeIdFilter) {
-      q = query(
-        collection(db, USERS_COLLECTION),
-        where('storeId', '==', storeIdFilter),
-        orderBy('createdAt', 'desc')
-      );
-    }
+    // Filter by store WITHOUT combining where + orderBy: that pair needs a composite
+    // index in Firestore, and without one the query threw and silently fell back to the
+    // stale local cache. Sorting a store's staff list client-side is cheap.
+    const q = storeIdFilter
+      ? query(collection(db, USERS_COLLECTION), where('storeId', '==', storeIdFilter))
+      : query(collection(db, USERS_COLLECTION), orderBy('createdAt', 'desc'));
+
     const snapshot = await getDocs(q);
     if (!snapshot.empty) {
-      const users = snapshot.docs.map((d) => normalizeUserProfile(d.id, d.data()));
-      setLocalData(USERS_COLLECTION, users);
+      const users = snapshot.docs
+        .map((d) => normalizeUserProfile(d.id, d.data()))
+        .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      if (!storeIdFilter) setLocalData(USERS_COLLECTION, users);
       return users;
     }
   } catch (error) {
@@ -170,9 +170,10 @@ export const createUserProfile = async (
     updatedAt: now
   };
 
+  let cloudError: any = null;
   try {
     const userRef = doc(db, USERS_COLLECTION, userId);
-    await setDoc(userRef, newUser);
+    await setDoc(userRef, stripUndefined(newUser));
 
     if (adminUser) {
       await logAudit(
@@ -190,13 +191,21 @@ export const createUserProfile = async (
         }
       );
     }
-  } catch (error) {
-    console.warn('Firestore createUserProfile notice, saving to local cache:', error);
+  } catch (error: any) {
+    console.error('Firestore createUserProfile FAILED (cloud not updated):', error);
+    cloudError = error;
   }
 
   const users = getLocalData<UserProfile[]>(USERS_COLLECTION, INITIAL_USERS);
   const updated = [newUser, ...users.filter((u) => u.id !== userId)];
   setLocalData(USERS_COLLECTION, updated);
+
+  // A profile that only exists in this browser's cache is not a usable account.
+  if (cloudError) {
+    throw new Error(
+      `Could not save the user account to the cloud (${cloudError.code || 'error'}: ${cloudError.message || cloudError}).`
+    );
+  }
 
   return newUser;
 };
@@ -206,16 +215,28 @@ export const updateUserProfile = async (
   updates: Partial<UserProfile>,
   adminUser: UserProfile
 ): Promise<void> => {
+  let cloudError: any = null;
   try {
     const userRef = doc(db, USERS_COLLECTION, userId);
-    await updateDoc(userRef, { ...updates, updatedAt: new Date().toISOString() });
-  } catch (error) {
-    console.warn(`Firestore updateUserProfile notice (${userId}), updating local cache:`, error);
+    await setDoc(
+      userRef,
+      stripUndefined({ ...updates, updatedAt: new Date().toISOString() }),
+      { merge: true }
+    );
+  } catch (error: any) {
+    console.error(`Firestore updateUserProfile FAILED (${userId}):`, error);
+    cloudError = error;
   }
 
   const users = getLocalData<UserProfile[]>(USERS_COLLECTION, INITIAL_USERS);
   const updated = users.map((u) => (u.id === userId ? { ...u, ...updates, updatedAt: new Date().toISOString() } : u));
   setLocalData(USERS_COLLECTION, updated);
+
+  if (cloudError) {
+    throw new Error(
+      `Could not save the user changes to the cloud (${cloudError.code || 'error'}: ${cloudError.message || cloudError}).`
+    );
+  }
 };
 
 export const toggleUserStatus = async (
