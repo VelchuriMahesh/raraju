@@ -182,7 +182,11 @@ export const assignDailyStock = async (
       remainingQuantity: remaining,
       assignedByUserId: adminUser.id,
       assignedByUserName: adminUser.fullName,
-      notes,
+      // Only include `notes` when it actually has a value. Firestore rejects the
+      // entire document on an undefined field; ignoreUndefinedProperties in
+      // firebase.ts covers this, but the getFirestore() fallback branch there does
+      // not inherit that setting, so the field is omitted at the source too.
+      ...(notes !== undefined ? { notes } : {}),
       createdAt: existingAssignment?.createdAt || now,
       updatedAt: now
     };

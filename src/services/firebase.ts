@@ -27,6 +27,12 @@ export const auth = getAuth(app);
 export const db = (() => {
   try {
     return initializeFirestore(app, {
+      // REQUIRED. Many documents in this app carry optional fields (assignment
+      // `notes`, sale `customer`/`splitPayments`, product `description`, admin
+      // `storeId`, ...). Without this flag Firestore rejects the WHOLE write with
+      //   "Unsupported field value: undefined (found in field notes ...)"
+      // which is what silently broke every Daily Stock Assignment.
+      ignoreUndefinedProperties: true,
       localCache: persistentLocalCache({
         tabManager: persistentMultipleTabManager()
       })
