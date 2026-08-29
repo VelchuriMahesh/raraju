@@ -10,7 +10,7 @@ import {
   orderBy,
   onSnapshot
 } from 'firebase/firestore';
-import { db } from './firebase';
+import { db, stripUndefined } from './firebase';
 import { Store, StoreStatus } from '../types/store';
 import { logAudit } from './auditService';
 import { UserProfile } from '../types/auth';
@@ -106,9 +106,10 @@ export const createStore = async (
     updatedAt: now
   };
 
+  let cloudError: any = null;
   try {
     const storeRef = doc(db, STORES_COLLECTION, newStoreId);
-    await setDoc(storeRef, newStore);
+    await setDoc(storeRef, stripUndefined(newStore));
 
     await logAudit(
       adminUser.id,
@@ -122,13 +123,21 @@ export const createStore = async (
         newValue: storeData
       }
     );
-  } catch (error) {
-    console.warn('Firestore createStore notice, saving to local cache:', error);
+  } catch (error: any) {
+    console.error('Firestore createStore FAILED (cloud not updated):', error);
+    cloudError = error;
   }
 
   const stores = getLocalData<Store[]>(STORES_COLLECTION, INITIAL_STORES);
   const updated = [newStore, ...stores];
   setLocalData(STORES_COLLECTION, updated);
+
+  // A branch that only exists in this browser cannot be used by its cashier.
+  if (cloudError) {
+    throw new Error(
+      `Could not save the store to the cloud (${cloudError.code || 'error'}: ${cloudError.message || cloudError}).`
+    );
+  }
 
   return newStore;
 };
@@ -138,12 +147,16 @@ export const updateStore = async (
   updates: Partial<Store>,
   adminUser: UserProfile
 ): Promise<void> => {
+  let cloudError: any = null;
   try {
     const storeRef = doc(db, STORES_COLLECTION, storeId);
-    await updateDoc(storeRef, {
-      ...updates,
-      updatedAt: new Date().toISOString()
-    });
+    // setDoc+merge rather than updateDoc: updateDoc hard-fails when the document is
+    // missing (e.g. a branch that only ever got written to the local cache).
+    await setDoc(
+      storeRef,
+      stripUndefined({ ...updates, updatedAt: new Date().toISOString() }),
+      { merge: true }
+    );
 
     await logAudit(
       adminUser.id,
@@ -157,13 +170,20 @@ export const updateStore = async (
         newValue: updates
       }
     );
-  } catch (error) {
-    console.warn(`Firestore updateStore notice (${storeId}), updating local cache:`, error);
+  } catch (error: any) {
+    console.error(`Firestore updateStore FAILED (${storeId}):`, error);
+    cloudError = error;
   }
 
   const stores = getLocalData<Store[]>(STORES_COLLECTION, INITIAL_STORES);
   const updated = stores.map((s) => (s.id === storeId ? { ...s, ...updates, updatedAt: new Date().toISOString() } : s));
   setLocalData(STORES_COLLECTION, updated);
+
+  if (cloudError) {
+    throw new Error(
+      `Could not save the store changes to the cloud (${cloudError.code || 'error'}: ${cloudError.message || cloudError}).`
+    );
+  }
 };
 
 export const toggleStoreStatus = async (

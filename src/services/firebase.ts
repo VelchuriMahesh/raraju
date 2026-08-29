@@ -19,14 +19,20 @@ const firebaseConfig = {
 
 // Initialize Firebase App
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
-export const firebaseProjectId = app.options.projectId || firebaseConfig.projectId;
 
 export const auth = getAuth(app);
 
 // Modern Firebase v10 Multi-Tab Persistent Firestore Initialization
+//
+// ignoreUndefinedProperties is REQUIRED: many documents in this app carry optional
+// fields (assignment `notes`, product `description`/`barcode`, admin `storeId`, ...).
+// Without this flag Firestore rejects the whole write with
+// "Unsupported field value: undefined", which previously made every Daily Stock
+// Assignment silently fail to reach the cloud.
 export const db = (() => {
   try {
     return initializeFirestore(app, {
+      ignoreUndefinedProperties: true,
       localCache: persistentLocalCache({
         tabManager: persistentMultipleTabManager()
       })
@@ -38,3 +44,23 @@ export const db = (() => {
 })();
 
 export default app;
+
+/**
+ * Recursively removes `undefined` values so a document can never be rejected with
+ * "Unsupported field value: undefined". `ignoreUndefinedProperties` above already
+ * covers this, but the getFirestore() fallback branch does not inherit that setting,
+ * so writes still pass their payload through this helper.
+ */
+export const stripUndefined = <T>(value: T): T => {
+  if (Array.isArray(value)) {
+    return value.map((v) => stripUndefined(v)) as unknown as T;
+  }
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    const out: Record<string, unknown> = {};
+    Object.entries(value as Record<string, unknown>).forEach(([k, v]) => {
+      if (v !== undefined) out[k] = stripUndefined(v);
+    });
+    return out as T;
+  }
+  return value;
+};

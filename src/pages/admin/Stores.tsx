@@ -13,7 +13,8 @@ import {
   Key,
   Mail,
   Eye,
-  EyeOff
+  EyeOff,
+  AlertTriangle
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
@@ -454,6 +455,18 @@ export const Stores: React.FC = () => {
                       className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-slate-900 font-mono focus:outline-none focus:border-indigo-500"
                     />
                   </div>
+
+                  {editingStore && (
+                    <div className="flex items-start gap-2 p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-[11px] font-semibold text-amber-900">
+                      <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-amber-600" />
+                      <span>
+                        Changing the password here updates the store record only — the actual
+                        sign-in password is held by Firebase Authentication and is not changed
+                        from this screen. To reset it, use "Forgot password" on the login screen
+                        or the Firebase console (Authentication → Users).
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
 

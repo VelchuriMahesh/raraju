@@ -5,235 +5,214 @@ import {
   onAuthStateChanged,
   User as FirebaseUser
 } from 'firebase/auth';
-import { auth, db } from './firebase';
+import { auth } from './firebase';
 import { UserProfile, UserRole } from '../types/auth';
 import { getUserById, getUserByEmail, createUserProfile } from './userService';
 import { logAudit } from './auditService';
-import { collection, doc, getDoc, getDocs, query, setDoc, where } from 'firebase/firestore';
 import { Store } from '../types/store';
+import { getLocalData } from './fallbackData';
+import { getStores } from './storeService';
+import { isAdminEmail } from './adminConfig';
 
-const STORES_COLLECTION = 'stores';
-const USERS_COLLECTION = 'users';
-const DEFAULT_STORE_ID = 'S1';
-const DEFAULT_STORE_NAME = 'krupa';
+export { isAdminEmail };
 
-interface CanonicalStoreAssignment {
-  id: string;
-  name: string;
-  code: string;
-}
+const friendlyAuthError = (err: any): Error => {
+  switch (err?.code) {
+    case 'auth/wrong-password':
+    case 'auth/invalid-credential':
+    case 'auth/user-not-found':
+      return new Error('Incorrect email or password. Please try again.');
+    case 'auth/invalid-email':
+      return new Error('That email address is not valid.');
+    case 'auth/user-disabled':
+      return new Error('This account has been disabled. Contact the administrator.');
+    case 'auth/too-many-requests':
+      return new Error('Too many failed attempts. Please wait a moment and try again.');
+    case 'auth/network-request-failed':
+      return new Error('No network connection. Please check your internet and retry.');
+    case 'auth/weak-password':
+      return new Error('Password is too weak. Use at least 6 characters.');
+    default:
+      return new Error(err?.message || 'Login failed. Please try again.');
+  }
+};
 
-const storeToAssignment = (store: Store): CanonicalStoreAssignment => ({
-  id: store.code || store.id,
-  name: store.name || DEFAULT_STORE_NAME,
-  code: store.code || store.id || DEFAULT_STORE_ID
-});
-
-const resolveStoreAssignment = async (
+/**
+ * Resolves which branch a cashier belongs to.
+ *
+ * Order matters: the store the ADMIN assigned on the user record always wins, so that
+ * re-assigning a cashier in the admin panel actually takes effect. Only when no
+ * assignment exists do we fall back to matching the store's configured login email.
+ *
+ * This deliberately returns null rather than "the first store in the list" — the old
+ * blanket `|| localStores[0]` fallback handed every unrecognised login the keys to
+ * branch #1 and silently overrode whatever the admin had configured.
+ */
+const resolveAssignedStore = (
   cleanEmail: string,
-  currentStoreId?: string | null
-): Promise<CanonicalStoreAssignment> => {
-  if (currentStoreId) {
-    const byCodeSnap = await getDocs(query(collection(db, STORES_COLLECTION), where('code', '==', currentStoreId)));
-    if (!byCodeSnap.empty) {
-      return storeToAssignment({ id: byCodeSnap.docs[0].id, ...byCodeSnap.docs[0].data() } as Store);
-    }
+  profileStoreId?: string,
+  storesOverride?: Store[]
+): Store | null => {
+  const stores = storesOverride?.length
+    ? storesOverride
+    : getLocalData<Store[]>('stores', []);
 
-    const byDocIdSnap = await getDoc(doc(db, STORES_COLLECTION, currentStoreId));
-    if (byDocIdSnap.exists()) {
-      return storeToAssignment({ id: byDocIdSnap.id, ...byDocIdSnap.data() } as Store);
-    }
+  if (profileStoreId) {
+    const byId = stores.find((s) => s.id === profileStoreId);
+    if (byId) return byId;
   }
 
-  const byLoginEmailSnap = await getDocs(
-    query(collection(db, STORES_COLLECTION), where('loginEmail', '==', cleanEmail))
+  return (
+    stores.find(
+      (s) =>
+        s.loginEmail?.toLowerCase().trim() === cleanEmail ||
+        s.email?.toLowerCase().trim() === cleanEmail
+    ) || null
   );
-  if (!byLoginEmailSnap.empty) {
-    return storeToAssignment({ id: byLoginEmailSnap.docs[0].id, ...byLoginEmailSnap.docs[0].data() } as Store);
-  }
-
-  const byEmailSnap = await getDocs(query(collection(db, STORES_COLLECTION), where('email', '==', cleanEmail)));
-  if (!byEmailSnap.empty) {
-    return storeToAssignment({ id: byEmailSnap.docs[0].id, ...byEmailSnap.docs[0].data() } as Store);
-  }
-
-  return {
-    id: DEFAULT_STORE_ID,
-    name: DEFAULT_STORE_NAME,
-    code: DEFAULT_STORE_ID
-  };
 };
 
-const persistAuthUidProfile = async (
-  authUid: string,
-  profile: UserProfile,
-  previousProfileId?: string
-): Promise<UserProfile> => {
-  const now = new Date().toISOString();
-  const canonicalProfile: UserProfile = {
-    ...profile,
-    id: authUid,
-    updatedAt: now
-  };
-
-  await setDoc(doc(db, USERS_COLLECTION, authUid), canonicalProfile, { merge: true });
-  if (previousProfileId && previousProfileId !== authUid) {
-    await setDoc(
-      doc(db, USERS_COLLECTION, previousProfileId),
-      {
-        ...profile,
-        storeId: canonicalProfile.storeId,
-        storeName: canonicalProfile.storeName,
-        updatedAt: now
-      },
-      { merge: true }
-    );
-  }
-
-  return canonicalProfile;
-};
-
-const normalizeStoreStaffProfile = async (
+/**
+ * Applies the admin-controlled record on top of a profile: role, branch assignment and
+ * display name all come from Firestore, NOT from guesses about the email address.
+ */
+const applyRoleAndStore = (
   profile: UserProfile,
   cleanEmail: string,
-  authUid: string
-): Promise<UserProfile> => {
-  if (profile.role === 'SUPER_ADMIN') return profile;
+  assignedStore: Store | null
+): UserProfile => {
+  const admin = isAdminEmail(cleanEmail) || profile.role === 'SUPER_ADMIN';
 
-  const assignedStore = await resolveStoreAssignment(cleanEmail, profile.storeId);
-  const previousProfileId = profile.id;
-  const normalized: UserProfile = {
-    ...profile,
-    storeId: assignedStore.id,
-    storeName: assignedStore.name,
-    employeeId: profile.employeeId || `EMP-${assignedStore.code}-01`,
-    status: 'ACTIVE'
-  };
+  if (admin) {
+    profile.role = 'SUPER_ADMIN';
+    profile.storeId = undefined;
+    profile.storeName = undefined;
+    return profile;
+  }
 
-  return persistAuthUidProfile(authUid, normalized, previousProfileId);
+  profile.role = 'STORE_STAFF';
+  if (assignedStore) {
+    profile.storeId = assignedStore.id;
+    profile.storeName = assignedStore.name;
+    // Keep the name/employee id the admin entered; only fill in when blank.
+    if (!profile.employeeId) profile.employeeId = `EMP-${assignedStore.code || 'S1'}-01`;
+    if (!profile.fullName) profile.fullName = `${assignedStore.name} Cashier`;
+  }
+  return profile;
 };
 
 export const loginUser = async (email: string, password: string): Promise<UserProfile> => {
   const cleanEmail = email.trim().toLowerCase();
-  const isAdminEmail =
-    cleanEmail === 'raraju@gmail.com' ||
-    cleanEmail === 'admin@raraju.com' ||
-    cleanEmail.includes('admin') ||
-    cleanEmail.includes('raraju');
+  const adminEmail = isAdminEmail(cleanEmail);
+
+  // 1. Authenticate. A failure here is FATAL — we never fabricate a local uid.
+  //
+  // The previous implementation fell back to `uid = user_<email>` whenever Firebase
+  // rejected the credentials, then loaded that email's profile from Firestore anyway.
+  // The practical effect was that ANY password logged you in as the matching user,
+  // including the super admin.
+  let uid = '';
+  try {
+    const cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
+    uid = cred.user.uid;
+  } catch (authErr: any) {
+    const firstTimeCodes = [
+      'auth/user-not-found',
+      'auth/invalid-credential',
+      'auth/wrong-password'
+    ];
+    if (!firstTimeCodes.includes(authErr.code)) {
+      throw friendlyAuthError(authErr);
+    }
+    // The address may simply not have an auth account yet (stores are provisioned on
+    // first login). Creating it only succeeds when the email is genuinely unused; if
+    // the account exists, the password was wrong and we surface that.
+    try {
+      const newCred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+      uid = newCred.user.uid;
+    } catch (createErr: any) {
+      if (createErr.code === 'auth/email-already-in-use') {
+        throw new Error('Incorrect password for this account. Please try again.');
+      }
+      throw friendlyAuthError(createErr);
+    }
+  }
+
+  // 2. Load the admin-managed profile: by uid first, then by email (store logins are
+  // created by the admin under a `user_<email>` document id, so the uid will not match).
+  let profile: UserProfile | null = null;
+  try {
+    profile = await getUserById(uid);
+    if (!profile) profile = await getUserByEmail(cleanEmail);
+  } catch (dbErr) {
+    console.warn('Profile lookup failed, continuing with defaults:', dbErr);
+  }
+
+  // 3. Resolve the branch from live store data (not just the local cache).
+  let stores: Store[] = [];
+  try {
+    stores = await getStores();
+  } catch (e) {
+    stores = getLocalData<Store[]>('stores', []);
+  }
+  const assignedStore = adminEmail
+    ? null
+    : resolveAssignedStore(cleanEmail, profile?.storeId, stores);
+
+  if (!profile) {
+    const role: UserRole = adminEmail ? 'SUPER_ADMIN' : 'STORE_STAFF';
+    const now = new Date().toISOString();
+    profile = {
+      id: uid,
+      email: cleanEmail,
+      fullName: adminEmail
+        ? 'RARAJU Admin'
+        : `${assignedStore?.name || 'Store'} Cashier`,
+      role,
+      storeId: assignedStore?.id,
+      storeName: assignedStore?.name,
+      employeeId: adminEmail ? 'EMP-ADM-01' : `EMP-${assignedStore?.code || 'S1'}-01`,
+      status: 'ACTIVE',
+      createdAt: now,
+      updatedAt: now
+    };
+
+    try {
+      await createUserProfile(profile.id, profile);
+    } catch (saveErr) {
+      console.warn('Could not persist new user profile:', saveErr);
+    }
+  }
+
+  profile = applyRoleAndStore(profile, cleanEmail, assignedStore);
+
+  if (profile.status === 'INACTIVE') {
+    try {
+      await firebaseSignOut(auth);
+    } catch (e) {}
+    throw new Error('Your account has been deactivated.');
+  }
+
+  // A cashier whose branch has been switched off must not be able to bill.
+  if (profile.role === 'STORE_STAFF' && assignedStore && assignedStore.status === 'INACTIVE') {
+    try {
+      await firebaseSignOut(auth);
+    } catch (e) {}
+    throw new Error(`Store "${assignedStore.name}" is currently deactivated. Contact the administrator.`);
+  }
 
   try {
-    let uid = '';
+    await logAudit(
+      profile.id,
+      profile.fullName,
+      profile.role,
+      'USER_LOGIN',
+      'Auth',
+      `Logged in successfully (${cleanEmail})`,
+      { storeId: profile.storeId, storeName: profile.storeName }
+    );
+  } catch (e) {}
 
-    // Attempt Firebase Authentication
-    try {
-      const cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
-      uid = cred.user.uid;
-    } catch (authErr: any) {
-      if (
-        authErr.code === 'auth/user-not-found' ||
-        authErr.code === 'auth/invalid-credential' ||
-        authErr.code === 'auth/wrong-password' ||
-        authErr.code === 'auth/invalid-email'
-      ) {
-        try {
-          const newCred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
-          uid = newCred.user.uid;
-        } catch (createErr: any) {
-          if (createErr.code === 'auth/email-already-in-use') {
-            try {
-              const retryCred = await signInWithEmailAndPassword(auth, cleanEmail, password);
-              uid = retryCred.user.uid;
-            } catch (retryErr) {
-              uid = `user_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
-            }
-          } else {
-            uid = `user_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
-          }
-        }
-      } else {
-        uid = `user_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
-      }
-    }
-
-    // Retrieve or construct User Profile
-    let profile: UserProfile | null = null;
-    try {
-      if (uid) {
-        profile = await getUserById(uid);
-      }
-      if (!profile) {
-        profile = await getUserByEmail(cleanEmail);
-      }
-    } catch (dbErr) {}
-
-    if (!profile) {
-      const role: UserRole = isAdminEmail ? 'SUPER_ADMIN' : 'STORE_STAFF';
-      const assignedStore = isAdminEmail ? null : await resolveStoreAssignment(cleanEmail);
-      const storeId = assignedStore?.id;
-      const storeName = assignedStore?.name;
-      const fullName = isAdminEmail
-        ? 'RARAJU Admin'
-        : `${storeName || DEFAULT_STORE_NAME} Cashier`;
-      const employeeId = isAdminEmail
-        ? 'EMP-ADM-01'
-        : `EMP-${assignedStore?.code || DEFAULT_STORE_ID}-01`;
-
-      profile = {
-        id: uid || `user_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`,
-        email: cleanEmail,
-        fullName,
-        role,
-        storeId,
-        storeName,
-        employeeId,
-        status: 'ACTIVE',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-
-      try {
-        await createUserProfile(profile.id, profile);
-      } catch (saveErr) {}
-    } else {
-      if (!isAdminEmail && uid) {
-        profile = await normalizeStoreStaffProfile(profile, cleanEmail, uid);
-      }
-    }
-
-    if (isAdminEmail) {
-      profile.role = 'SUPER_ADMIN';
-      profile.status = 'ACTIVE';
-      profile.storeId = undefined;
-      profile.storeName = undefined;
-      if (uid) {
-        await persistAuthUidProfile(uid, profile, profile.id);
-      }
-    }
-
-    if (profile.status === 'INACTIVE') {
-      try {
-        await firebaseSignOut(auth);
-      } catch (e) {}
-      throw new Error('Your account has been deactivated.');
-    }
-
-    try {
-      await logAudit(
-        profile.id,
-        profile.fullName,
-        profile.role,
-        'USER_LOGIN',
-        'Auth',
-        `Logged in successfully (${cleanEmail})`,
-        { storeId: profile.storeId, storeName: profile.storeName }
-      );
-    } catch (e) {}
-
-    return profile;
-  } catch (error: any) {
-    console.error('Login error:', error);
-    throw error;
-  }
+  return profile;
 };
 
 export const registerUser = async (
@@ -247,15 +226,18 @@ export const registerUser = async (
 ): Promise<UserProfile> => {
   const cleanEmail = email.trim().toLowerCase();
 
-  let uid = '';
+  let uid: string;
   try {
     const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
     uid = cred.user.uid;
   } catch (err: any) {
-    uid = `user_${Date.now()}`;
+    if (err.code === 'auth/email-already-in-use') {
+      throw new Error(`An account already exists for ${cleanEmail}.`);
+    }
+    throw friendlyAuthError(err);
   }
 
-  const profile = await createUserProfile(
+  return createUserProfile(
     uid,
     {
       email: cleanEmail,
@@ -267,8 +249,6 @@ export const registerUser = async (
     },
     adminUser
   );
-
-  return profile;
 };
 
 export const logoutUser = async (currentUser?: UserProfile | null): Promise<void> => {
@@ -298,45 +278,49 @@ export const subscribeToAuthChanges = (
     }
 
     const email = (firebaseUser.email || '').toLowerCase().trim();
-    const isAdmin =
-      email === 'raraju@gmail.com' ||
-      email === 'admin@raraju.com' ||
-      email.includes('admin') ||
-      email.includes('raraju');
+    const adminEmail = isAdminEmail(email);
 
-    const fallbackProfile: UserProfile = {
+    // Provisional profile so the UI can paint immediately on reload.
+    const cachedStore = adminEmail ? null : resolveAssignedStore(email);
+    const now = new Date().toISOString();
+    callback({
       id: firebaseUser.uid,
       email,
-      fullName: isAdmin ? 'RARAJU Admin' : `${DEFAULT_STORE_NAME} Cashier`,
-      role: isAdmin ? 'SUPER_ADMIN' : 'STORE_STAFF',
-      storeId: isAdmin ? undefined : DEFAULT_STORE_ID,
-      storeName: isAdmin ? undefined : DEFAULT_STORE_NAME,
-      employeeId: isAdmin ? 'EMP-ADM-01' : `EMP-${DEFAULT_STORE_ID}-01`,
+      fullName: adminEmail ? 'RARAJU Admin' : `${cachedStore?.name || 'Store'} Cashier`,
+      role: adminEmail ? 'SUPER_ADMIN' : 'STORE_STAFF',
+      storeId: adminEmail ? undefined : cachedStore?.id,
+      storeName: adminEmail ? undefined : cachedStore?.name,
+      employeeId: adminEmail ? 'EMP-ADM-01' : `EMP-${cachedStore?.code || 'S1'}-01`,
       status: 'ACTIVE',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
+      createdAt: now,
+      updatedAt: now
+    });
 
-    // Immediate non-blocking emission
-    callback(fallbackProfile);
+    // Authoritative refresh. Looking the profile up by EMAIL as well as by uid is
+    // essential: the admin panel creates store logins under a `user_<email>` document
+    // id, so a uid-only lookup never found them and every page reload fell back to the
+    // guessed profile above — which is why admin edits appeared not to stick.
+    (async () => {
+      try {
+        let profile = await getUserById(firebaseUser.uid);
+        if (!profile) profile = await getUserByEmail(email);
+        if (!profile) return;
 
-    // Background profile refresh from Firestore
-    Promise.all([getUserById(firebaseUser.uid), getUserByEmail(email)])
-      .then(async ([profileById, profileByEmail]) => {
-        let profile = profileById || profileByEmail;
-        if (profile) {
-          if (isAdmin) {
-            profile.role = 'SUPER_ADMIN';
-            profile.status = 'ACTIVE';
-            profile.storeId = undefined;
-            profile.storeName = undefined;
-            profile = await persistAuthUidProfile(firebaseUser.uid, profile, profile.id);
-          } else {
-            profile = await normalizeStoreStaffProfile(profile, email, firebaseUser.uid);
-          }
-          callback(profile);
+        let stores: Store[] = [];
+        try {
+          stores = await getStores();
+        } catch (e) {
+          stores = getLocalData<Store[]>('stores', []);
         }
-      })
-      .catch(() => {});
+
+        const assignedStore = adminEmail
+          ? null
+          : resolveAssignedStore(email, profile.storeId, stores);
+
+        callback(applyRoleAndStore(profile, email, assignedStore));
+      } catch (e) {
+        console.warn('Background profile refresh failed:', e);
+      }
+    })();
   });
 };

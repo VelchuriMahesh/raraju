@@ -91,7 +91,10 @@ export const Reconciliation: React.FC = () => {
 
       // Load past reports
       const reportsSnap = await getDocs(
-        query(collection(db, 'stockReconciliations'), orderBy('timestamp', 'desc'))
+        // Must match RECONCILIATION_COLLECTION in inventoryService.ts. This read used to
+        // point at 'stockReconciliations' while reconcileStoreStock() wrote to
+        // 'reconciliations', so the audit history here was always empty.
+        query(collection(db, 'reconciliations'), orderBy('timestamp', 'desc'))
       );
       setPastReports(
         reportsSnap.docs.map((d) => ({ id: d.id, ...d.data() } as StockReconciliationReport))

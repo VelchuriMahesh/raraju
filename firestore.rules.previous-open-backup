@@ -1,0 +1,112 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for security and role checks
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.email == 'raraju@gmail.com' ||
+        request.auth.token.email == 'admin@raraju.com' ||
+        getUserData().role == 'SUPER_ADMIN'
+      );
+    }
+
+    // 1. Users Collection
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    // 2. Stores Collection (krupa, S1, etc.)
+    match /stores/{storeId} {
+      allow read, write: if true;
+    }
+
+    // 3. Products Catalog
+    match /products/{productId} {
+      allow read, write: if true;
+    }
+
+    // 4. Product Categories
+    match /categories/{categoryId} {
+      allow read, write: if true;
+    }
+
+    // 5. Daily Stock Assignments
+    match /dailyStockAssignments/{assignmentId} {
+      allow read, write: if true;
+    }
+
+    // 6. Store Inventory
+    match /inventory/{inventoryId} {
+      allow read, write: if true;
+    }
+
+    // 7. Stock Movements (IN, OUT, SALE, ADJUSTMENT, RETURN)
+    match /stockMovements/{movementId} {
+      allow read, write: if true;
+    }
+
+    // 8. Stock Transfers (Store-to-Store)
+    match /stockTransfers/{transferId} {
+      allow read, write: if true;
+    }
+
+    // 9. Sales & Invoices
+    match /sales/{saleId} {
+      allow read, write: if true;
+    }
+
+    // 10. Daily Closings (Day End Register Closing)
+    match /dailyClosings/{closingId} {
+      allow read, write: if true;
+    }
+
+    // 11. Store Expenses
+    match /expenses/{expenseId} {
+      allow read, write: if true;
+    }
+
+    // 12. Supplier Purchases / Inward Stock
+    match /purchases/{purchaseId} {
+      allow read, write: if true;
+    }
+
+    // 13. Customers & Credit Balances
+    match /customers/{customerId} {
+      allow read, write: if true;
+    }
+
+    // 14. Business Settings & Thermal Invoice Config
+    match /settings/{settingId} {
+      allow read, write: if true;
+    }
+
+    // 15. Audit Logs
+    match /auditLogs/{logId} {
+      allow read, write: if true;
+    }
+
+    // 16. Notifications & Low Stock Alerts
+    match /notifications/{notifId} {
+      allow read, write: if true;
+    }
+
+    // 17. Atomic Invoice / Bill Number Counters
+    match /counters/{counterId} {
+      allow read, write: if true;
+    }
+
+    // Global Catch-all for any nested subcollections
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

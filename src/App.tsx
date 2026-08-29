@@ -15,6 +15,15 @@ import { Sales } from './pages/admin/Sales';
 import { DailyHistory } from './pages/admin/DailyHistory';
 import { Reports } from './pages/admin/Reports';
 import { Settings } from './pages/admin/Settings';
+import { Users } from './pages/admin/Users';
+import { Categories } from './pages/admin/Categories';
+import { Reconciliation } from './pages/admin/Reconciliation';
+import { Purchases } from './pages/admin/Purchases';
+import { Transfers } from './pages/admin/Transfers';
+import { Customers } from './pages/admin/Customers';
+import { Expenses } from './pages/admin/Expenses';
+import { DailyClosing } from './pages/admin/DailyClosing';
+import { AuditLogs } from './pages/admin/AuditLogs';
 
 // Store Staff Pages
 import { POS } from './pages/store/POS';
@@ -151,7 +160,83 @@ export const AppContent: React.FC = () => {
             />
             <Route
               path="/admin/inventory"
-              element={<Navigate to="/admin/stock-assignment" replace />}
+              element={
+                <AdminLayout>
+                  <Inventory />
+                </AdminLayout>
+              }
+            />
+            <Route
+              path="/admin/users"
+              element={
+                <AdminLayout>
+                  <Users />
+                </AdminLayout>
+              }
+            />
+            <Route
+              path="/admin/categories"
+              element={
+                <AdminLayout>
+                  <Categories />
+                </AdminLayout>
+              }
+            />
+            <Route
+              path="/admin/reconciliation"
+              element={
+                <AdminLayout>
+                  <Reconciliation />
+                </AdminLayout>
+              }
+            />
+            <Route
+              path="/admin/purchases"
+              element={
+                <AdminLayout>
+                  <Purchases />
+                </AdminLayout>
+              }
+            />
+            <Route
+              path="/admin/transfers"
+              element={
+                <AdminLayout>
+                  <Transfers />
+                </AdminLayout>
+              }
+            />
+            <Route
+              path="/admin/customers"
+              element={
+                <AdminLayout>
+                  <Customers />
+                </AdminLayout>
+              }
+            />
+            <Route
+              path="/admin/expenses"
+              element={
+                <AdminLayout>
+                  <Expenses />
+                </AdminLayout>
+              }
+            />
+            <Route
+              path="/admin/closings"
+              element={
+                <AdminLayout>
+                  <DailyClosing />
+                </AdminLayout>
+              }
+            />
+            <Route
+              path="/admin/audit"
+              element={
+                <AdminLayout>
+                  <AuditLogs />
+                </AdminLayout>
+              }
             />
             <Route
               path="/admin/sales"
@@ -194,7 +279,17 @@ export const AppContent: React.FC = () => {
             <Route path="/products" element={<Navigate to="/admin/products" replace />} />
             <Route path="/stock-assignment" element={<Navigate to="/admin/stock-assignment" replace />} />
             <Route path="/stock" element={<Navigate to="/admin/stock-assignment" replace />} />
-            <Route path="/inventory" element={<Navigate to="/admin/stock-assignment" replace />} />
+            <Route path="/inventory" element={<Navigate to="/admin/inventory" replace />} />
+            <Route path="/users" element={<Navigate to="/admin/users" replace />} />
+            <Route path="/staff" element={<Navigate to="/admin/users" replace />} />
+            <Route path="/categories" element={<Navigate to="/admin/categories" replace />} />
+            <Route path="/reconciliation" element={<Navigate to="/admin/reconciliation" replace />} />
+            <Route path="/purchases" element={<Navigate to="/admin/purchases" replace />} />
+            <Route path="/transfers" element={<Navigate to="/admin/transfers" replace />} />
+            <Route path="/customers" element={<Navigate to="/admin/customers" replace />} />
+            <Route path="/expenses" element={<Navigate to="/admin/expenses" replace />} />
+            <Route path="/closings" element={<Navigate to="/admin/closings" replace />} />
+            <Route path="/audit" element={<Navigate to="/admin/audit" replace />} />
             <Route path="/sales" element={<Navigate to="/admin/sales" replace />} />
             <Route path="/invoices" element={<Navigate to="/admin/sales" replace />} />
             <Route path="/daily-history" element={<Navigate to="/admin/daily-history" replace />} />

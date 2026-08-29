@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   CalendarPlus,
   Store as StoreIcon,
@@ -31,12 +31,14 @@ import {
 } from '../../services/stockAssignmentService';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
+import { useConfirm } from '../../context/ConfirmContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { exportToCSV } from '../../services/reportService';
 
 export const StockAssignment: React.FC = () => {
   const { currentUser } = useAuth();
   const { success, error } = useToast();
+  const { confirm } = useConfirm();
   const { language, t } = useLanguage();
 
   const [stores, setStores] = useState<Store[]>([]);
@@ -56,13 +58,11 @@ export const StockAssignment: React.FC = () => {
   const [historyStoreFilter, setHistoryStoreFilter] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
-  const getCanonicalStoreId = (store: Store) => store.code || store.id;
-
   useEffect(() => {
     const unsubStores = subscribeToStores((liveStores) => {
       setStores(liveStores);
       if (!selectedStoreId && liveStores.length > 0) {
-        setSelectedStoreId(getCanonicalStoreId(liveStores[0]));
+        setSelectedStoreId(liveStores[0].id);
       }
     });
 
@@ -97,22 +97,44 @@ export const StockAssignment: React.FC = () => {
     return map;
   }, [products]);
 
-  // Update input values when store or date changes to show existing assignment if any
+  // Boxes the admin has typed into during the current store+date selection. They are
+  // left alone when a live snapshot arrives; every other box keeps tracking the saved
+  // quantity. Previously this effect re-ran on EVERY `assignments` snapshot and
+  // rewrote all ten boxes, wiping numbers out from under the admin mid-entry.
+  const dirtyInputs = useRef<Set<string>>(new Set());
+  const inputsContextKey = useRef<string>('');
+
   useEffect(() => {
-    if (!selectedStoreId || !assignmentDate) return;
+    if (!selectedStoreId || !assignmentDate || products.length === 0) return;
     const normSelectedDate = normalizeDateString(assignmentDate);
+
+    // Switching branch or date starts a fresh entry sheet.
+    const contextKey = `${selectedStoreId}|${normSelectedDate}`;
+    if (inputsContextKey.current !== contextKey) {
+      inputsContextKey.current = contextKey;
+      dirtyInputs.current = new Set();
+    }
+
     const existing = assignments.filter(
       (a) => a.storeId === selectedStoreId && normalizeDateString(a.date) === normSelectedDate
     );
-    const updated: { [id: string]: string } = {};
-    products.forEach((p) => {
-      const found = existing.find((a) => a.productId === p.id);
-      updated[p.id] = found ? String(found.assignedQuantity) : '0';
+
+    setStockInputs((prev) => {
+      const updated: { [id: string]: string } = {};
+      products.forEach((p) => {
+        if (dirtyInputs.current.has(p.id)) {
+          updated[p.id] = prev[p.id] ?? '0';
+          return;
+        }
+        const found = existing.find((a) => a.productId === p.id || (a.sku && p.sku && a.sku === p.sku));
+        updated[p.id] = found ? String(found.assignedQuantity) : '0';
+      });
+      return updated;
     });
-    setStockInputs(updated);
   }, [selectedStoreId, assignmentDate, assignments, products]);
 
   const handleStockInputChange = (productId: string, val: string) => {
+    dirtyInputs.current.add(productId);
     setStockInputs((prev) => ({
       ...prev,
       [productId]: val
@@ -121,50 +143,125 @@ export const StockAssignment: React.FC = () => {
 
   const handleSaveAssignments = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentUser || !selectedStoreId) return;
+    if (!currentUser || !selectedStoreId || isSubmitting) return;
 
-    const targetStore = stores.find((s) => getCanonicalStoreId(s) === selectedStoreId);
+    const targetStore = stores.find((s) => s.id === selectedStoreId);
     if (!targetStore) {
       error('Invalid store selection');
       return;
     }
 
+    const normDate = normalizeDateString(assignmentDate);
+
+    // GUARD 1 — never save from a half-initialised sheet. Until the boxes have been
+    // populated for THIS store+date, every quantity still reads '0', and saving would
+    // wipe the day's real assignments. A stray submit (Enter key, double-click, an HMR
+    // reload landing on this page) previously did exactly that.
+    if (loading || products.length === 0 || inputsContextKey.current !== `${selectedStoreId}|${normDate}`) {
+      error('Stock sheet is still loading — please wait a moment and try again.');
+      return;
+    }
+
+    const existingForContext = assignments.filter(
+      (a) => a.storeId === targetStore.id && normalizeDateString(a.date) === normDate
+    );
+
+    // GUARD 2 — a save that reduces or clears assignments already dispatched today is
+    // destructive, so make the admin confirm it rather than doing it silently.
+    const reductions = existingForContext.filter((a) => {
+      const prod = products.find((p) => p.id === a.productId);
+      if (!prod) return false;
+      const qty = parseInt(stockInputs[prod.id] || '0', 10);
+      return !isNaN(qty) && qty < a.assignedQuantity;
+    });
+
+    if (reductions.length > 0) {
+      const summary = reductions
+        .map((a) => `${a.productName}: ${a.assignedQuantity} → ${parseInt(stockInputs[a.productId] || '0', 10)}`)
+        .join(', ');
+      const confirmed = await confirm({
+        title: 'Reduce assigned stock?',
+        message:
+          `This will REDUCE stock already assigned to "${targetStore.name}" for ${normDate}:\n\n${summary}\n\n` +
+          `The cashier will immediately see the lower quantity. Continue?`,
+        confirmText: 'Yes, reduce',
+        isDestructive: true
+      });
+      if (!confirmed) return;
+    }
+
     setIsSubmitting(true);
-    try {
-      let savedCount = 0;
-      for (const prod of products) {
-        const qty = parseInt(stockInputs[prod.id] || '0', 10);
-        if (!isNaN(qty) && qty >= 0) {
-          await assignDailyStock(
-            assignmentDate,
-            selectedStoreId,
-            targetStore.name,
-            targetStore.code,
-            prod.id,
-            prod.name,
-            prod.sku,
-            prod.unit,
-            qty,
-            currentUser
-          );
-          savedCount++;
-        }
+    let savedCount = 0;
+    const failures: string[] = [];
+
+    for (const prod of products) {
+      const qty = parseInt(stockInputs[prod.id] || '0', 10);
+      if (isNaN(qty) || qty < 0) continue;
+
+      // GUARD 3 — assigned quantity can never drop below what the store has already
+      // sold today; that would leave the ledger with more sold than ever dispatched.
+      const existingRow = existingForContext.find((a) => a.productId === prod.id);
+      if (existingRow && qty < (existingRow.soldQuantity || 0)) {
+        failures.push(
+          `${prod.name}: cannot assign ${qty} — ${existingRow.soldQuantity} bags have already been sold today.`
+        );
+        continue;
       }
 
-      success(
-        `Assigned daily stock for ${savedCount} products to "${targetStore.name}" on ${assignmentDate}.`
+      // Only write a row when there is something to record: a positive quantity, or an
+      // existing assignment being corrected. Writing every product at 0 used to fill the
+      // ledger with empty "0 Bags" rows.
+      const hasExisting = assignments.some(
+        (a) =>
+          a.storeId === targetStore.id &&
+          normalizeDateString(a.date) === normDate &&
+          a.productId === prod.id
       );
-    } catch (err: any) {
-      error('Failed to assign daily stock: ' + err.message);
-    } finally {
-      setIsSubmitting(false);
+      if (qty === 0 && !hasExisting) continue;
+
+      try {
+        await assignDailyStock(
+          assignmentDate,
+          targetStore.id,
+          targetStore.name,
+          targetStore.code,
+          prod.id,
+          prod.name,
+          prod.sku,
+          prod.unit,
+          qty,
+          currentUser
+        );
+        savedCount++;
+      } catch (err: any) {
+        failures.push(`${prod.name}: ${err.message}`);
+      }
     }
+
+    setIsSubmitting(false);
+
+    if (failures.length > 0) {
+      error(
+        `${failures.length} product(s) FAILED to sync to the cloud and will NOT reach the store. ${failures[0]}`
+      );
+      return;
+    }
+    if (savedCount === 0) {
+      error('Nothing to assign — enter at least one bag quantity above.');
+      return;
+    }
+    // Saved values now come back from the live feed.
+    dirtyInputs.current = new Set();
+    success(
+      `Assigned daily stock for ${savedCount} product(s) to "${targetStore.name}" on ${assignmentDate}.`
+    );
   };
 
   // Filtered History
   const filteredHistory = useMemo(() => {
     return assignments.filter((a) => {
-      const matchesDate = !historyDate || a.date === historyDate;
+      const matchesDate =
+        !historyDate || normalizeDateString(a.date) === normalizeDateString(historyDate);
       const matchesStore = historyStoreFilter === 'ALL' || a.storeId === historyStoreFilter;
       const q = searchQuery.toLowerCase().trim();
       const matchesSearch =
@@ -304,7 +401,7 @@ export const StockAssignment: React.FC = () => {
                 className="px-3 py-1.5 bg-white border border-slate-300 rounded-xl font-bold text-slate-900 shadow-sm focus:outline-none focus:border-indigo-500"
               >
                 {stores.map((s) => (
-                  <option key={s.id} value={getCanonicalStoreId(s)}>
+                  <option key={s.id} value={s.id}>
                     {s.name} ({s.code})
                   </option>
                 ))}
@@ -434,7 +531,7 @@ export const StockAssignment: React.FC = () => {
               >
                 <option value="ALL">All Stores</option>
                 {stores.map((s) => (
-                  <option key={s.id} value={getCanonicalStoreId(s)}>
+                  <option key={s.id} value={s.id}>
                     {s.name}
                   </option>
                 ))}

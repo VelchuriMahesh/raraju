@@ -15,7 +15,16 @@ import {
   CalendarPlus,
   X,
   ChevronRight,
-  MoreHorizontal
+  MoreHorizontal,
+  Tags,
+  ClipboardCheck,
+  Truck,
+  ArrowLeftRight,
+  Wallet,
+  Banknote,
+  Users,
+  UserCog,
+  ScrollText
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
@@ -31,15 +40,28 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({ children }) => {
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
   const location = useLocation();
 
-  // Primary navigation for desktop and drawer
+  // Primary navigation for desktop and drawer.
+  // Every admin screen that exists must be reachable from here — Users, Categories,
+  // Inventory, Reconciliation, Purchases, Transfers, Customers, Expenses, Daily
+  // Closings and Audit Logs were all built but had no route and no menu entry.
   const allNavItems = [
     { id: 'stock-assignment', path: '/admin/stock-assignment', labelKey: 'stockAssignment', icon: CalendarPlus },
     { id: 'sales', path: '/admin/sales', labelKey: 'sales', icon: Receipt },
     { id: 'products', path: '/admin/products', labelKey: 'products', icon: Package },
+    { id: 'categories', path: '/admin/categories', labelKey: 'categories', icon: Tags },
+    { id: 'inventory', path: '/admin/inventory', labelKey: 'inventory', icon: Boxes },
+    { id: 'reconciliation', path: '/admin/reconciliation', labelKey: 'reconciliation', icon: ClipboardCheck },
+    { id: 'purchases', path: '/admin/purchases', labelKey: 'purchases', icon: Truck },
+    { id: 'transfers', path: '/admin/transfers', labelKey: 'transfers', icon: ArrowLeftRight },
     { id: 'daily-history', path: '/admin/daily-history', labelKey: 'dailyHistory', icon: CalendarDays },
+    { id: 'closings', path: '/admin/closings', labelKey: 'closings', icon: Wallet },
+    { id: 'expenses', path: '/admin/expenses', labelKey: 'expenses', icon: Banknote },
+    { id: 'customers', path: '/admin/customers', labelKey: 'customers', icon: Users },
     { id: 'dashboard', path: '/admin/dashboard', labelKey: 'dashboard', icon: LayoutDashboard },
     { id: 'stores', path: '/admin/stores', labelKey: 'stores', icon: Store },
+    { id: 'users', path: '/admin/users', labelKey: 'users', icon: UserCog },
     { id: 'reports', path: '/admin/reports', labelKey: 'reports', icon: FileText },
+    { id: 'audit', path: '/admin/audit', labelKey: 'audit', icon: ScrollText },
     { id: 'settings', path: '/admin/settings', labelKey: 'settings', icon: Settings }
   ];
 
@@ -51,9 +73,10 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({ children }) => {
     { id: 'daily-history', path: '/admin/daily-history', label: 'Daily History', teLabel: 'చరిత్ర', icon: CalendarDays }
   ];
 
-  const isMoreActive = ['/admin/dashboard', '/admin/stores', '/admin/reports', '/admin/settings'].some((p) =>
-    location.pathname.startsWith(p)
-  );
+  const mobilePrimaryPaths = mobilePrimaryItems.map((i) => i.path);
+  const isMoreActive =
+    location.pathname.startsWith('/admin/') &&
+    !mobilePrimaryPaths.some((p) => location.pathname.startsWith(p));
 
   const handleLanguageToggle = () => {
     if (language === 'dual') setLanguage('te');
