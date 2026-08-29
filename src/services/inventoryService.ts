@@ -3,11 +3,13 @@ import {
   doc,
   getDoc,
   getDocs,
-  setDoc,
-  query,
-  where,
+  onSnapshot,
   orderBy,
-  onSnapshot
+  query,
+  runTransaction,
+  serverTimestamp,
+  setDoc,
+  where
 } from 'firebase/firestore';
 import { db } from './firebase';
 import {
@@ -21,11 +23,6 @@ import { Product } from '../types/product';
 import { logAudit } from './auditService';
 import { sendNotification } from './notificationService';
 import { UserProfile } from '../types/auth';
-import {
-  INITIAL_INVENTORIES,
-  getLocalData,
-  setLocalData
-} from './fallbackData';
 
 const INVENTORY_COLLECTION = 'inventory';
 const MOVEMENTS_COLLECTION = 'stockMovements';
@@ -33,114 +30,89 @@ const RECONCILIATION_COLLECTION = 'reconciliations';
 
 export const getInventoryDocId = (storeId: string, productId: string) => `${storeId}_${productId}`;
 
+const toInventory = (id: string, data: any): StoreInventory => ({
+  id,
+  ...(data as Omit<StoreInventory, 'id'>)
+});
+
+const sortInventory = (items: StoreInventory[]): StoreInventory[] =>
+  [...items].sort((a, b) => {
+    const timeA = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    const timeB = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+    return timeB - timeA;
+  });
+
 export const getAllInventory = async (): Promise<StoreInventory[]> => {
-  try {
-    const snapshot = await getDocs(collection(db, INVENTORY_COLLECTION));
-    if (!snapshot.empty) {
-      const items = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as StoreInventory));
-      setLocalData(INVENTORY_COLLECTION, items);
-      return items;
-    }
-  } catch (error) {
-    console.warn('Firestore getAllInventory notice, using local cache:', error);
-  }
-  return getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
+  const snapshot = await getDocs(collection(db, INVENTORY_COLLECTION));
+  return sortInventory(snapshot.docs.map((d) => toInventory(d.id, d.data())));
 };
 
 export const subscribeToAllInventory = (
-  callback: (inventories: StoreInventory[]) => void
+  callback: (inventories: StoreInventory[]) => void,
+  onError?: (error: Error) => void
 ): (() => void) => {
-  try {
-    return onSnapshot(
-      collection(db, INVENTORY_COLLECTION),
-      (snapshot) => {
-        if (!snapshot.empty) {
-          const items = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as StoreInventory));
-          setLocalData(INVENTORY_COLLECTION, items);
-          callback(items);
-        } else {
-          const cached = getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
-          callback(cached);
-        }
-      },
-      (error) => {
-        console.warn('Firestore subscribeToAllInventory fallback:', error);
-        callback(getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES));
-      }
-    );
-  } catch (err) {
-    callback(getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES));
-    return () => {};
-  }
+  return onSnapshot(
+    collection(db, INVENTORY_COLLECTION),
+    (snapshot) => {
+      callback(sortInventory(snapshot.docs.map((d) => toInventory(d.id, d.data()))));
+    },
+    (error) => {
+      console.error('Firestore subscribeToAllInventory error:', error);
+      onError?.(error);
+      callback([]);
+    }
+  );
 };
 
 export const getStoreInventory = async (storeId: string): Promise<StoreInventory[]> => {
-  try {
-    const q = query(
-      collection(db, INVENTORY_COLLECTION),
-      where('storeId', '==', storeId)
-    );
-    const snapshot = await getDocs(q);
-    if (!snapshot.empty) {
-      const items = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as StoreInventory));
-      return items;
-    }
-  } catch (error) {
-    console.warn(`Firestore getStoreInventory notice (${storeId}), using local cache:`, error);
-  }
+  if (!storeId) return [];
 
-  const allInvs = getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
-  return allInvs.filter((inv) => inv.storeId === storeId);
+  const q = query(
+    collection(db, INVENTORY_COLLECTION),
+    where('storeId', '==', storeId)
+  );
+  const snapshot = await getDocs(q);
+  return sortInventory(snapshot.docs.map((d) => toInventory(d.id, d.data())));
 };
 
 export const subscribeToStoreInventory = (
   storeId: string,
-  callback: (inventories: StoreInventory[]) => void
+  callback: (inventories: StoreInventory[]) => void,
+  onError?: (error: Error) => void
 ): (() => void) => {
-  try {
-    const q = query(
-      collection(db, INVENTORY_COLLECTION),
-      where('storeId', '==', storeId)
-    );
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        if (!snapshot.empty) {
-          const items = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as StoreInventory));
-          callback(items);
-        } else {
-          const all = getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
-          callback(all.filter((i) => i.storeId === storeId));
-        }
-      },
-      (error) => {
-        console.warn('Firestore subscribeToStoreInventory fallback:', error);
-        const all = getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
-        callback(all.filter((i) => i.storeId === storeId));
-      }
-    );
-  } catch (err) {
-    const all = getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
-    callback(all.filter((i) => i.storeId === storeId));
+  if (!storeId) {
+    callback([]);
     return () => {};
   }
+
+  const q = query(
+    collection(db, INVENTORY_COLLECTION),
+    where('storeId', '==', storeId)
+  );
+
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      callback(sortInventory(snapshot.docs.map((d) => toInventory(d.id, d.data()))));
+    },
+    (error) => {
+      console.error('Firestore subscribeToStoreInventory error:', error);
+      onError?.(error);
+      callback([]);
+    }
+  );
 };
 
 export const getProductInventoryInStore = async (
   storeId: string,
   productId: string
 ): Promise<StoreInventory | null> => {
-  const invDocId = getInventoryDocId(storeId, productId);
-  try {
-    const docRef = doc(db, INVENTORY_COLLECTION, invDocId);
-    const snap = await getDoc(docRef);
-    if (snap.exists()) return { id: snap.id, ...snap.data() } as StoreInventory;
-  } catch (error) {
-    console.warn(`Firestore getProductInventoryInStore notice (${invDocId}), using local cache:`, error);
-  }
+  if (!storeId || !productId) return null;
 
-  const allInvs = getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
-  return allInvs.find((inv) => inv.storeId === storeId && inv.productId === productId) || null;
+  const invDocId = getInventoryDocId(storeId, productId);
+  const docRef = doc(db, INVENTORY_COLLECTION, invDocId);
+  const snap = await getDoc(docRef);
+  return snap.exists() ? toInventory(snap.id, snap.data()) : null;
 };
 
 export const adjustStock = async (
@@ -155,58 +127,62 @@ export const adjustStock = async (
   referenceId?: string,
   productObj?: Product
 ): Promise<StoreInventory> => {
+  if (!storeId) throw new Error('A canonical store ID is required before adjusting stock.');
+  if (!Number.isFinite(quantityChange) || quantityChange === 0) {
+    throw new Error('Stock adjustment quantity must be a non-zero number.');
+  }
+
   const productId = typeof productOrId === 'string' ? productOrId : productOrId.id;
   const productName = typeof productOrId === 'string' ? productObj?.name || 'Product' : productOrId.name;
   const sku = typeof productOrId === 'string' ? productObj?.sku || '' : productOrId.sku;
   const purchasePrice = typeof productOrId === 'string' ? productObj?.purchasePrice || 0 : productOrId.purchasePrice;
 
+  if (!productId) throw new Error('A product ID is required before adjusting stock.');
+
   const invDocId = getInventoryDocId(storeId, productId);
+  const invRef = doc(db, INVENTORY_COLLECTION, invDocId);
+  const movementRef = doc(collection(db, MOVEMENTS_COLLECTION));
   const now = new Date().toISOString();
 
+  let updatedInventory: StoreInventory | null = null;
   let previousQty = 0;
-  let lastPurchasePrice = purchasePrice;
+  let newQty = 0;
 
-  try {
-    const invRef = doc(db, INVENTORY_COLLECTION, invDocId);
-    const invSnap = await getDoc(invRef);
-    if (invSnap.exists()) {
-      const currentData = invSnap.data() as StoreInventory;
-      previousQty = currentData.quantity;
-      lastPurchasePrice = currentData.lastPurchasePrice || purchasePrice;
-    }
-  } catch (e) {
-    const allInvs = getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
-    const existing = allInvs.find((i) => i.storeId === storeId && i.productId === productId);
-    if (existing) {
-      previousQty = existing.quantity;
-      lastPurchasePrice = existing.lastPurchasePrice || purchasePrice;
-    }
-  }
+  await runTransaction(db, async (transaction) => {
+    const invSnap = await transaction.get(invRef);
+    previousQty = invSnap.exists() ? Number(invSnap.data().quantity || 0) : 0;
+    const lastPurchasePrice = invSnap.exists()
+      ? Number(invSnap.data().lastPurchasePrice || purchasePrice)
+      : purchasePrice;
 
-  const newQty = previousQty + quantityChange;
-  if (newQty < 0) {
-    throw new Error(
-      `Cannot adjust stock below 0. Current stock is ${previousQty}, requested reduction is ${Math.abs(quantityChange)}.`
+    newQty = previousQty + quantityChange;
+    if (newQty < 0) {
+      throw new Error(
+        `Cannot adjust stock below 0. Current stock is ${previousQty}, requested reduction is ${Math.abs(quantityChange)}.`
+      );
+    }
+
+    updatedInventory = {
+      id: invDocId,
+      storeId,
+      storeName,
+      productId,
+      productName,
+      sku,
+      quantity: newQty,
+      lastPurchasePrice,
+      updatedAt: now
+    };
+
+    transaction.set(
+      invRef,
+      {
+        ...updatedInventory,
+        updatedAtServer: serverTimestamp()
+      },
+      { merge: true }
     );
-  }
 
-  const updatedInventory: StoreInventory = {
-    id: invDocId,
-    storeId,
-    productId,
-    productName,
-    sku,
-    quantity: newQty,
-    lastPurchasePrice,
-    updatedAt: now
-  };
-
-  try {
-    const invRef = doc(db, INVENTORY_COLLECTION, invDocId);
-    await setDoc(invRef, updatedInventory);
-
-    // Record stock movement ledger
-    const movementRef = doc(collection(db, MOVEMENTS_COLLECTION));
     const movement: StockMovement = {
       id: movementRef.id,
       storeId,
@@ -225,8 +201,13 @@ export const adjustStock = async (
       userRole: user.role,
       timestamp: now
     };
-    await setDoc(movementRef, movement);
+    transaction.set(movementRef, {
+      ...movement,
+      timestampServer: serverTimestamp()
+    });
+  });
 
+  try {
     await logAudit(
       user.id,
       user.fullName,
@@ -237,16 +218,11 @@ export const adjustStock = async (
       { storeId, storeName, entityId: invDocId, oldValue: previousQty, newValue: newQty }
     );
   } catch (err) {
-    console.warn('Firestore adjustStock notice, updating local cache:', err);
+    console.warn('Firestore adjustStock audit notice:', err);
   }
 
-  const allInvs = getLocalData<StoreInventory[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
-  const updatedAll = [updatedInventory, ...allInvs.filter((i) => i.id !== invDocId)];
-  setLocalData(INVENTORY_COLLECTION, updatedAll);
-
-  // Notify Store Staff of stock adjustment
   try {
-    sendNotification({
+    await sendNotification({
       recipientRole: 'STORE_STAFF',
       storeId,
       storeName,
@@ -258,7 +234,7 @@ export const adjustStock = async (
     });
   } catch (e) {}
 
-  return updatedInventory;
+  return updatedInventory!;
 };
 
 export const reconcileStoreStock = async (
@@ -286,9 +262,9 @@ export const reconcileStoreStock = async (
     }
   }
 
-  const reportId = `recon_${Date.now()}`;
+  const reportRef = doc(collection(db, RECONCILIATION_COLLECTION));
   const report: StockReconciliationReport = {
-    id: reportId,
+    id: reportRef.id,
     storeId,
     storeName,
     reconciledBy: user.id,
@@ -298,11 +274,10 @@ export const reconcileStoreStock = async (
     timestamp: now
   };
 
-  try {
-    const reportRef = doc(collection(db, RECONCILIATION_COLLECTION));
-    report.id = reportRef.id;
-    await setDoc(reportRef, report);
-  } catch (e) {}
+  await setDoc(reportRef, {
+    ...report,
+    timestampServer: serverTimestamp()
+  });
 
   return report;
 };
@@ -329,9 +304,9 @@ export const getStockMovements = async (
       );
     }
     const snapshot = await getDocs(q);
-    if (!snapshot.empty) {
-      return snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as StockMovement));
-    }
+    return snapshot.docs
+      .slice(0, maxLimit)
+      .map((d) => ({ id: d.id, ...d.data() } as StockMovement));
   } catch (error) {
     console.warn('Firestore getStockMovements notice, returning empty list:', error);
   }

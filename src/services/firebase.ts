@@ -19,6 +19,7 @@ const firebaseConfig = {
 
 // Initialize Firebase App
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+export const firebaseProjectId = app.options.projectId || firebaseConfig.projectId;
 
 export const auth = getAuth(app);
 

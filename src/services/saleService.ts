@@ -1,33 +1,31 @@
 import {
   collection,
+  deleteDoc,
   doc,
   getDoc,
   getDocs,
-  setDoc,
-  updateDoc,
-  deleteDoc,
+  onSnapshot,
   query,
-  where,
-  orderBy,
   runTransaction,
-  onSnapshot
+  serverTimestamp,
+  updateDoc,
+  where
 } from 'firebase/firestore';
 import { db } from './firebase';
 import { Sale, SaleItem, PaymentMethod, SplitPaymentDetail, SaleCustomerInfo } from '../types/sale';
 import { StockMovement } from '../types/inventory';
 import { UserProfile } from '../types/auth';
-import { Store } from '../types/store';
 import { logAudit } from './auditService';
 import { getInventoryDocId } from './inventoryService';
 import { sendNotification } from './notificationService';
-import { recordSaleInDailyAssignment } from './stockAssignmentService';
-import { INITIAL_SALES, getLocalData, setLocalData, INITIAL_INVENTORIES } from './fallbackData';
+import { getAssignmentDocId, getTodayDateString, normalizeDateString } from './stockAssignmentService';
 
 const SALES_COLLECTION = 'sales';
 const INVENTORY_COLLECTION = 'inventory';
 const MOVEMENTS_COLLECTION = 'stockMovements';
 const COUNTERS_COLLECTION = 'counters';
 const STORES_COLLECTION = 'stores';
+const ASSIGNMENTS_COLLECTION = 'dailyStockAssignments';
 
 export interface CheckoutPayload {
   storeId: string;
@@ -53,38 +51,31 @@ export interface CheckoutPayload {
   notes?: string;
 }
 
-/**
- * Normalizes legacy sales so "Main Branch" is converted to the active branch name
- */
-const normalizeSalesData = (rawSales: Sale[]): Sale[] => {
-  const stores = getLocalData<Store[]>(STORES_COLLECTION, []);
-  const defaultStore = stores[0];
+const toSale = (id: string, data: any): Sale => ({
+  id,
+  ...(data as Omit<Sale, 'id'>)
+});
 
-  return rawSales.map((s) => {
-    let storeName = s.storeName;
-    let storeId = s.storeId;
+const sortSales = (sales: Sale[]): Sale[] =>
+  [...sales].sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
 
-    if (
-      !storeName ||
-      storeName.includes('Main Branch') ||
-      storeName.includes('ప్రధాన బ్రాంచ్') ||
-      storeId === 'store_1_main' ||
-      storeName === 'Store Branch'
-    ) {
-      if (defaultStore) {
-        storeName = defaultStore.name;
-        storeId = defaultStore.id;
-      } else {
-        storeName = 'krupa';
-        storeId = 's1';
-      }
+const assertCanUseStore = (storeId: string, user: UserProfile) => {
+  if (!storeId) throw new Error('A canonical store ID is required before completing a sale.');
+  if (user.role !== 'SUPER_ADMIN' && user.storeId !== storeId) {
+    throw new Error('This user is not authorized to sell from the selected store.');
+  }
+};
+
+const assertValidSaleItems = (items: CheckoutPayload['items']) => {
+  if (!items || items.length === 0) {
+    throw new Error('Cannot complete a sale with an empty cart.');
+  }
+
+  items.forEach((item) => {
+    if (!item.productId) throw new Error('Every sale item must contain a product ID.');
+    if (!Number.isFinite(item.quantity) || item.quantity <= 0) {
+      throw new Error(`Invalid quantity for "${item.productName}".`);
     }
-
-    return {
-      ...s,
-      storeName,
-      storeId
-    };
   });
 };
 
@@ -105,205 +96,183 @@ export const completeSaleTransaction = async (
     notes
   } = payload;
 
+  assertCanUseStore(storeId, user);
+  assertValidSaleItems(items);
+
   const now = new Date().toISOString();
-  const dateStr = now.split('T')[0];
+  const businessDate = getTodayDateString();
+  const saleDocRef = doc(collection(db, SALES_COLLECTION));
+  const counterRef = doc(db, COUNTERS_COLLECTION, `invoice_${storeId}`);
+  const storeRef = doc(db, STORES_COLLECTION, storeId);
+
   let generatedInvoiceNumber = '';
-  let completedSale: Sale | null = null;
 
-  try {
-    const saleDocRef = doc(collection(db, SALES_COLLECTION));
-    const counterRef = doc(db, COUNTERS_COLLECTION, `invoice_${storeId}`);
-    const storeRef = doc(db, STORES_COLLECTION, storeId);
+  const completedSale = await runTransaction(db, async (transaction): Promise<Sale> => {
+    const counterSnap = await transaction.get(counterRef);
+    const storeSnap = await transaction.get(storeRef);
 
-    await runTransaction(db, async (transaction) => {
-      // 1. ALL READS FIRST
-      const counterSnap = await transaction.get(counterRef);
-      const storeSnap = await transaction.get(storeRef);
+    const invSnaps: {
+      [productId: string]: {
+        ref: ReturnType<typeof doc>;
+        currentQty: number;
+        lastPrice: number;
+      };
+    } = {};
+    const assignmentSnaps: {
+      [productId: string]: {
+        ref: ReturnType<typeof doc>;
+        assignedQuantity: number;
+        soldQuantity: number;
+        exists: boolean;
+      };
+    } = {};
 
-      const invSnaps: { [productId: string]: { ref: any; currentQty: number; lastPrice: number } } = {};
-      for (const item of items) {
-        const invDocId = getInventoryDocId(storeId, item.productId);
-        const invRef = doc(db, INVENTORY_COLLECTION, invDocId);
-        const snap = await transaction.get(invRef);
-        invSnaps[item.productId] = {
-          ref: invRef,
-          currentQty: snap.exists() ? snap.data().quantity || 0 : 0,
-          lastPrice: snap.exists() ? snap.data().lastPurchasePrice || 0 : item.standardPrice * 0.8
-        };
+    for (const item of items) {
+      const invDocId = getInventoryDocId(storeId, item.productId);
+      const invRef = doc(db, INVENTORY_COLLECTION, invDocId);
+      const invSnap = await transaction.get(invRef);
+      const currentQty = invSnap.exists() ? Number(invSnap.data().quantity || 0) : 0;
+
+      if (!invSnap.exists() || currentQty < item.quantity) {
+        throw new Error(
+          `Insufficient stock for "${item.productName}". Available: ${currentQty}, requested: ${item.quantity}.`
+        );
       }
 
-      // Sequential Invoice Number
-      let nextSeq = 1;
-      if (counterSnap.exists()) {
-        nextSeq = (counterSnap.data().lastNumber || 0) + 1;
-      }
-      const invoicePrefix = storeSnap.exists() ? storeSnap.data().invoicePrefix || 'S1-' : 'S1-';
-      generatedInvoiceNumber = `${invoicePrefix}${String(nextSeq).padStart(6, '0')}`;
+      invSnaps[item.productId] = {
+        ref: invRef,
+        currentQty,
+        lastPrice: invSnap.exists() ? Number(invSnap.data().lastPurchasePrice || 0) : item.standardPrice * 0.8
+      };
 
-      // 2. ALL WRITES AFTER READS
-      transaction.set(counterRef, { lastNumber: nextSeq }, { merge: true });
+      const assignmentDocId = getAssignmentDocId(businessDate, storeId, item.productId);
+      const assignmentRef = doc(db, ASSIGNMENTS_COLLECTION, assignmentDocId);
+      const assignmentSnap = await transaction.get(assignmentRef);
+      assignmentSnaps[item.productId] = {
+        ref: assignmentRef,
+        assignedQuantity: assignmentSnap.exists() ? Number(assignmentSnap.data().assignedQuantity || 0) : 0,
+        soldQuantity: assignmentSnap.exists() ? Number(assignmentSnap.data().soldQuantity || 0) : 0,
+        exists: assignmentSnap.exists()
+      };
+    }
 
-      const saleItems: SaleItem[] = [];
-      let subtotal = 0;
-      let totalDiscount = 0;
-      let totalCustomerRateDifference = 0;
-      let totalCOGS = 0;
+    let nextSeq = 1;
+    if (counterSnap.exists()) {
+      nextSeq = Number(counterSnap.data().lastNumber || 0) + 1;
+    }
+    const invoicePrefix = storeSnap.exists() ? storeSnap.data().invoicePrefix || `${storeId}-` : `${storeId}-`;
+    generatedInvoiceNumber = `${invoicePrefix}${String(nextSeq).padStart(6, '0')}`;
 
-      for (const item of items) {
-        const invInfo = invSnaps[item.productId];
-        const newQty = Math.max(0, invInfo.currentQty - item.quantity);
+    transaction.set(
+      counterRef,
+      {
+        storeId,
+        lastNumber: nextSeq,
+        updatedAt: now,
+        updatedAtServer: serverTimestamp()
+      },
+      { merge: true }
+    );
 
+    const saleItems: SaleItem[] = [];
+    let subtotal = 0;
+    let totalDiscount = 0;
+    let totalCustomerRateDifference = 0;
+    let totalCOGS = 0;
+
+    for (const item of items) {
+      const invInfo = invSnaps[item.productId];
+      const newQty = invInfo.currentQty - item.quantity;
+
+      transaction.set(
+        invInfo.ref,
+        {
+          quantity: newQty,
+          updatedAt: now,
+          updatedAtServer: serverTimestamp()
+        },
+        { merge: true }
+      );
+
+      const assignmentInfo = assignmentSnaps[item.productId];
+      if (assignmentInfo.exists) {
+        const newSold = assignmentInfo.soldQuantity + item.quantity;
+        const newRemaining = Math.max(0, assignmentInfo.assignedQuantity - newSold);
         transaction.set(
-          invInfo.ref,
+          assignmentInfo.ref,
           {
-            quantity: newQty,
-            updatedAt: now
+            soldQuantity: newSold,
+            remainingQuantity: newRemaining,
+            updatedAt: now,
+            updatedAtServer: serverTimestamp()
           },
           { merge: true }
         );
-
-        // Record stock movement ledger
-        const movementRef = doc(collection(db, MOVEMENTS_COLLECTION));
-        const movement: StockMovement = {
-          id: movementRef.id,
-          storeId,
-          storeName,
-          productId: item.productId,
-          productName: item.productName,
-          sku: item.sku,
-          type: 'SALE',
-          quantity: -item.quantity,
-          previousQuantity: invInfo.currentQty,
-          newQuantity: newQty,
-          referenceId: generatedInvoiceNumber,
-          userId: user.id,
-          userName: user.fullName,
-          userRole: user.role,
-          timestamp: now
-        };
-        transaction.set(movementRef, movement);
-
-        const itemActualPrice = item.actualPrice;
-        const discount = item.discount || 0;
-        const itemSubtotal = itemActualPrice * item.quantity - discount;
-        const itemTotal = itemSubtotal;
-        const rateDiff = (itemActualPrice - item.standardPrice) * item.quantity;
-
-        subtotal += itemSubtotal;
-        totalDiscount += discount;
-        totalCustomerRateDifference += rateDiff;
-        totalCOGS += invInfo.lastPrice * item.quantity;
-
-        saleItems.push({
-          id: `item_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-          productId: item.productId,
-          productName: item.productName,
-          sku: item.sku,
-          unit: item.unit,
-          quantity: item.quantity,
-          purchasePrice: invInfo.lastPrice,
-          standardPrice: item.standardPrice,
-          actualPrice: itemActualPrice,
-          rateDifference: itemActualPrice - item.standardPrice,
-          customerRateApplied: item.customerRateApplied,
-          customerRateReason: item.customerRateReason,
-          gstRate: 0,
-          gstAmount: 0,
-          discount,
-          total: itemTotal
-        });
       }
 
-      const grandTotal = subtotal + extraAmount;
-      const grossProfit = grandTotal - totalCOGS;
-      const changeDue = Math.max(0, (amountPaid || grandTotal) - grandTotal);
-
-      completedSale = {
-        id: saleDocRef.id,
-        invoiceNumber: generatedInvoiceNumber,
+      const movementRef = doc(collection(db, MOVEMENTS_COLLECTION));
+      const movement: StockMovement = {
+        id: movementRef.id,
         storeId,
         storeName,
-        employeeId: user.employeeId || 'STAFF',
-        employeeName: user.fullName,
-        customer,
-        items: saleItems,
-        itemCount: items.reduce((sum, i) => sum + i.quantity, 0),
-        subtotal,
-        totalGst: 0,
-        totalDiscount,
-        totalCustomerRateDifference,
-        extraAmount,
-        extraAmountReason,
-        grandTotal,
-        totalCostOfGoodsSold: totalCOGS,
-        grossProfit,
-        paymentMethod,
-        splitPayments: paymentMethod === 'SPLIT' ? splitPayments : undefined,
-        amountPaid: amountPaid !== undefined ? amountPaid : grandTotal,
-        changeDue,
-        status: 'COMPLETED',
-        notes,
-        createdAt: now
+        productId: item.productId,
+        productName: item.productName,
+        sku: item.sku,
+        type: 'SALE',
+        quantity: -item.quantity,
+        previousQuantity: invInfo.currentQty,
+        newQuantity: newQty,
+        referenceId: saleDocRef.id,
+        referenceNumber: generatedInvoiceNumber,
+        userId: user.id,
+        userName: user.fullName,
+        userRole: user.role,
+        timestamp: now
       };
+      transaction.set(movementRef, {
+        ...movement,
+        timestampServer: serverTimestamp()
+      });
 
-      transaction.set(saleDocRef, completedSale);
-    });
-  } catch (error) {
-    console.warn('Firestore runTransaction notice, executing direct write fallback:', error);
+      const itemActualPrice = item.actualPrice;
+      const discount = item.discount || 0;
+      const itemSubtotal = itemActualPrice * item.quantity - discount;
+      const rateDiff = (itemActualPrice - item.standardPrice) * item.quantity;
 
-    const saleId = `sale_${Date.now()}`;
-    const allStores = getLocalData<Store[]>(STORES_COLLECTION, []);
-    const storeObj = allStores.find((s) => s.id === storeId);
-    const storeNameStr = storeObj ? storeObj.name : storeName || 'krupa';
-    const prefix = storeObj?.invoicePrefix || 'S1-';
-    generatedInvoiceNumber = `${prefix}${String(Date.now()).slice(-6)}`;
-
-    let subtotal = 0;
-    const saleItems: SaleItem[] = [];
-    const allInvs = getLocalData<any[]>(INVENTORY_COLLECTION, INITIAL_INVENTORIES);
-
-    for (const reqItem of items) {
-      const actualPrice = reqItem.actualPrice;
-      const discount = reqItem.discount || 0;
-      const itemSubtotal = actualPrice * reqItem.quantity - discount;
       subtotal += itemSubtotal;
+      totalDiscount += discount;
+      totalCustomerRateDifference += rateDiff;
+      totalCOGS += invInfo.lastPrice * item.quantity;
 
       saleItems.push({
         id: `item_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        productId: reqItem.productId,
-        productName: reqItem.productName,
-        sku: reqItem.sku,
-        unit: reqItem.unit,
-        quantity: reqItem.quantity,
-        purchasePrice: reqItem.standardPrice * 0.8,
-        standardPrice: reqItem.standardPrice,
-        actualPrice,
-        rateDifference: actualPrice - reqItem.standardPrice,
-        customerRateApplied: reqItem.customerRateApplied,
-        customerRateReason: reqItem.customerRateReason,
+        productId: item.productId,
+        productName: item.productName,
+        sku: item.sku,
+        unit: item.unit,
+        quantity: item.quantity,
+        purchasePrice: invInfo.lastPrice,
+        standardPrice: item.standardPrice,
+        actualPrice: itemActualPrice,
+        rateDifference: itemActualPrice - item.standardPrice,
+        customerRateApplied: item.customerRateApplied,
+        customerRateReason: item.customerRateReason,
         gstRate: 0,
         gstAmount: 0,
         discount,
         total: itemSubtotal
       });
-
-      const invDocId = getInventoryDocId(storeId, reqItem.productId);
-      const targetInv = allInvs.find(
-        (i) => i.id === invDocId || (i.storeId === storeId && i.productId === reqItem.productId)
-      );
-      if (targetInv) {
-        targetInv.quantity = Math.max(0, targetInv.quantity - reqItem.quantity);
-      }
     }
 
-    setLocalData(INVENTORY_COLLECTION, allInvs);
     const grandTotal = subtotal + extraAmount;
+    const grossProfit = grandTotal - totalCOGS;
+    const changeDue = Math.max(0, (amountPaid || grandTotal) - grandTotal);
 
-    completedSale = {
-      id: saleId,
+    const completedSale: Sale = {
+      id: saleDocRef.id,
       invoiceNumber: generatedInvoiceNumber,
       storeId,
-      storeName: storeNameStr,
+      storeName,
       employeeId: user.employeeId || 'STAFF',
       employeeName: user.fullName,
       customer,
@@ -311,89 +280,66 @@ export const completeSaleTransaction = async (
       itemCount: items.reduce((sum, i) => sum + i.quantity, 0),
       subtotal,
       totalGst: 0,
-      totalDiscount: 0,
-      totalCustomerRateDifference: 0,
+      totalDiscount,
+      totalCustomerRateDifference,
       extraAmount,
       extraAmountReason,
       grandTotal,
-      totalCostOfGoodsSold: subtotal * 0.8,
-      grossProfit: subtotal * 0.2,
+      totalCostOfGoodsSold: totalCOGS,
+      grossProfit,
       paymentMethod,
-      splitPayments,
+      splitPayments: paymentMethod === 'SPLIT' ? splitPayments : undefined,
       amountPaid: amountPaid !== undefined ? amountPaid : grandTotal,
-      changeDue: Math.max(0, (amountPaid || grandTotal) - grandTotal),
+      changeDue,
       status: 'COMPLETED',
       notes,
       createdAt: now
     };
-  }
 
-  if (completedSale) {
-    // Cloud setDoc
-    try {
-      await setDoc(doc(db, SALES_COLLECTION, completedSale.id), completedSale);
-    } catch (e) {}
+    transaction.set(saleDocRef, {
+      ...completedSale,
+      businessDate,
+      createdAtServer: serverTimestamp()
+    });
 
-    // Update local storage with normalized names
-    const allSales = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, INITIAL_SALES));
-    const updated = [completedSale, ...allSales.filter((s) => s.id !== completedSale!.id)];
-    setLocalData(SALES_COLLECTION, updated);
+    return completedSale;
+  });
 
-    // Broadcast event
-    try {
-      window.dispatchEvent(new CustomEvent('raraju_sales_updated', { detail: completedSale }));
-    } catch (e) {}
+  const itemsSummary = completedSale.items.map((i) => `${i.productName} × ${i.quantity}`).join(', ');
 
-    // Daily stock ledger update
-    for (const soldItem of completedSale.items) {
-      try {
-        await recordSaleInDailyAssignment(
-          dateStr,
-          completedSale.storeId,
-          soldItem.productId,
-          soldItem.quantity
-        );
-      } catch (err) {}
-    }
+  try {
+    await sendNotification({
+      recipientRole: 'SUPER_ADMIN',
+      type: 'SALE_COMPLETED',
+      title: `Sale at ${completedSale.storeName}`,
+      titleTe: `${completedSale.storeName} వద్ద అమ్మకం జరిగింది`,
+      message: `${completedSale.employeeName} collected ₹${completedSale.grandTotal.toFixed(2)} via ${completedSale.paymentMethod} (Bill #${completedSale.invoiceNumber}) - ${itemsSummary}`,
+      messageTe: `${completedSale.employeeName} ${completedSale.paymentMethod} ద్వారా ₹${completedSale.grandTotal.toFixed(2)} వసూలు చేశారు (బిల్ #${completedSale.invoiceNumber}) - ${itemsSummary}`,
+      storeId: completedSale.storeId,
+      storeName: completedSale.storeName,
+      amount: completedSale.grandTotal,
+      paymentMethod: completedSale.paymentMethod,
+      invoiceNumber: completedSale.invoiceNumber
+    });
+  } catch (notifErr) {}
 
-    const itemsSummary = completedSale.items.map((i) => `${i.productName} × ${i.quantity}`).join(', ');
+  try {
+    await sendNotification({
+      recipientRole: 'STORE_STAFF',
+      storeId: completedSale.storeId,
+      storeName: completedSale.storeName,
+      type: 'SALE_COMPLETED',
+      title: `Sale Completed #${completedSale.invoiceNumber}`,
+      titleTe: `అమ్మకం పూర్తయింది #${completedSale.invoiceNumber}`,
+      message: `Collected ₹${completedSale.grandTotal.toFixed(2)} via ${completedSale.paymentMethod} (${itemsSummary})`,
+      messageTe: `${completedSale.paymentMethod} ద్వారా ₹${completedSale.grandTotal.toFixed(2)} వసూలు చేయబడింది (${itemsSummary})`,
+      amount: completedSale.grandTotal,
+      paymentMethod: completedSale.paymentMethod,
+      invoiceNumber: completedSale.invoiceNumber
+    });
+  } catch (notifErr) {}
 
-    // Send Notification to Admin
-    try {
-      await sendNotification({
-        recipientRole: 'SUPER_ADMIN',
-        type: 'SALE_COMPLETED',
-        title: `Sale at ${completedSale.storeName}`,
-        titleTe: `${completedSale.storeName} వద్ద అమ్మకం జరిగింది`,
-        message: `${completedSale.employeeName} collected ₹${completedSale.grandTotal.toFixed(2)} via ${completedSale.paymentMethod} (Bill #${completedSale.invoiceNumber}) - ${itemsSummary}`,
-        messageTe: `${completedSale.employeeName} ${completedSale.paymentMethod} ద్వారా ₹${completedSale.grandTotal.toFixed(2)} వసూలు చేశారు (బిల్ #${completedSale.invoiceNumber}) - ${itemsSummary}`,
-        storeId: completedSale.storeId,
-        storeName: completedSale.storeName,
-        amount: completedSale.grandTotal,
-        paymentMethod: completedSale.paymentMethod,
-        invoiceNumber: completedSale.invoiceNumber
-      });
-    } catch (notifErr) {}
-
-    // Send Notification to Storekeeper
-    try {
-      await sendNotification({
-        recipientRole: 'STORE_STAFF',
-        storeId: completedSale.storeId,
-        storeName: completedSale.storeName,
-        type: 'SALE_COMPLETED',
-        title: `Sale Completed #${completedSale.invoiceNumber}`,
-        titleTe: `అమ్మకం పూర్తయింది #${completedSale.invoiceNumber}`,
-        message: `Collected ₹${completedSale.grandTotal.toFixed(2)} via ${completedSale.paymentMethod} (${itemsSummary})`,
-        messageTe: `${completedSale.paymentMethod} ద్వారా ₹${completedSale.grandTotal.toFixed(2)} వసూలు చేయబడింది (${itemsSummary})`,
-        amount: completedSale.grandTotal,
-        paymentMethod: completedSale.paymentMethod,
-        invoiceNumber: completedSale.invoiceNumber
-      });
-    } catch (notifErr) {}
-  }
-
-  return completedSale!;
+  return completedSale;
 };
 
 export const getSales = async (
@@ -402,116 +348,41 @@ export const getSales = async (
   endDate?: string,
   limitCount = 100
 ): Promise<Sale[]> => {
-  try {
-    let q = query(collection(db, SALES_COLLECTION), orderBy('createdAt', 'desc'));
-    if (storeIdFilter) {
-      q = query(
-        collection(db, SALES_COLLECTION),
-        where('storeId', '==', storeIdFilter),
-        orderBy('createdAt', 'desc')
-      );
-    }
+  const salesRef = collection(db, SALES_COLLECTION);
+  const salesQuery = storeIdFilter ? query(salesRef, where('storeId', '==', storeIdFilter)) : salesRef;
+  const snapshot = await getDocs(salesQuery);
+  let sales = sortSales(snapshot.docs.map((d) => toSale(d.id, d.data())));
 
-    const snapshot = await getDocs(q);
-    if (!snapshot.empty) {
-      let raw = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Sale));
-      let sales = normalizeSalesData(raw);
-      if (startDate) sales = sales.filter((s) => s.createdAt >= startDate);
-      if (endDate) sales = sales.filter((s) => s.createdAt <= endDate);
-      setLocalData(SALES_COLLECTION, sales);
-      return sales.slice(0, limitCount);
-    }
-  } catch (error) {
-    console.warn('Firestore getSales notice, using local cache:', error);
-  }
-
-  let sales = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, INITIAL_SALES));
-  if (storeIdFilter) sales = sales.filter((s) => s.storeId === storeIdFilter);
   if (startDate) sales = sales.filter((s) => s.createdAt >= startDate);
   if (endDate) sales = sales.filter((s) => s.createdAt <= endDate);
   return sales.slice(0, limitCount);
 };
 
-export const syncLocalSalesToCloud = async (): Promise<void> => {
-  try {
-    const rawSales = getLocalData<Sale[]>(SALES_COLLECTION, []);
-    const localSales = normalizeSalesData(rawSales);
-    if (!localSales || localSales.length === 0) return;
-
-    for (const s of localSales) {
-      try {
-        const saleDocRef = doc(db, SALES_COLLECTION, s.id);
-        await setDoc(saleDocRef, s, { merge: true });
-      } catch (e) {}
-    }
-  } catch (err) {}
-};
-
 export const subscribeToSales = (
   callback: (sales: Sale[]) => void,
-  storeIdFilter?: string
+  storeIdFilter?: string,
+  onError?: (error: Error) => void
 ): (() => void) => {
-  // 1. Initial emission from local storage
-  const localSales = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, INITIAL_SALES));
-  callback(storeIdFilter ? localSales.filter((s) => s.storeId === storeIdFilter) : localSales);
+  const salesRef = collection(db, SALES_COLLECTION);
+  const salesQuery = storeIdFilter ? query(salesRef, where('storeId', '==', storeIdFilter)) : salesRef;
 
-  syncLocalSalesToCloud();
-
-  // 2. Cross-tab storage listener
-  const handleUpdate = () => {
-    const updated = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, INITIAL_SALES));
-    callback(storeIdFilter ? updated.filter((s) => s.storeId === storeIdFilter) : updated);
-  };
-
-  window.addEventListener('storage', handleUpdate);
-  window.addEventListener('raraju_sales_updated', handleUpdate);
-
-  // 3. Firestore live snapshot listener
-  let unsubscribeFirestore = () => {};
-  try {
-    unsubscribeFirestore = onSnapshot(
-      collection(db, SALES_COLLECTION),
-      (snapshot) => {
-        if (!snapshot.empty) {
-          const raw = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Sale));
-          raw.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-          const firestoreSales = normalizeSalesData(raw);
-          setLocalData(SALES_COLLECTION, firestoreSales);
-          callback(storeIdFilter ? firestoreSales.filter((s) => s.storeId === storeIdFilter) : firestoreSales);
-        } else {
-          const local = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, []));
-          callback(storeIdFilter ? local.filter((s) => s.storeId === storeIdFilter) : local);
-        }
-      },
-      (error) => {
-        console.warn('Firestore subscribeToSales notice:', error);
-        const local = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, []));
-        callback(storeIdFilter ? local.filter((s) => s.storeId === storeIdFilter) : local);
-      }
-    );
-  } catch (err) {}
-
-  return () => {
-    window.removeEventListener('storage', handleUpdate);
-    window.removeEventListener('raraju_sales_updated', handleUpdate);
-    unsubscribeFirestore();
-  };
+  return onSnapshot(
+    salesQuery,
+    (snapshot) => {
+      callback(sortSales(snapshot.docs.map((d) => toSale(d.id, d.data()))));
+    },
+    (error) => {
+      console.error('Firestore subscribeToSales error:', error);
+      onError?.(error);
+      callback([]);
+    }
+  );
 };
 
 export const getSaleById = async (saleId: string): Promise<Sale | null> => {
-  try {
-    const docRef = doc(db, SALES_COLLECTION, saleId);
-    const snap = await getDoc(docRef);
-    if (snap.exists()) {
-      const [normalized] = normalizeSalesData([{ id: snap.id, ...snap.data() } as Sale]);
-      return normalized;
-    }
-  } catch (error) {
-    console.warn(`Firestore getSaleById notice (${saleId}), using local cache:`, error);
-  }
-
-  const sales = normalizeSalesData(getLocalData<Sale[]>(SALES_COLLECTION, INITIAL_SALES));
-  return sales.find((s) => s.id === saleId) || null;
+  const docRef = doc(db, SALES_COLLECTION, saleId);
+  const snap = await getDoc(docRef);
+  return snap.exists() ? toSale(snap.id, snap.data()) : null;
 };
 
 export const cancelSale = async (
@@ -521,59 +392,115 @@ export const cancelSale = async (
   restoreStock = true
 ): Promise<void> => {
   const now = new Date().toISOString();
-  try {
+  const saleData = await runTransaction(db, async (transaction): Promise<Sale> => {
     const saleRef = doc(db, SALES_COLLECTION, saleId);
-    const saleSnap = await getDoc(saleRef);
-    if (saleSnap.exists()) {
-      const saleData = saleSnap.data() as Sale;
-      await updateDoc(saleRef, {
+    const saleSnap = await transaction.get(saleRef);
+    if (!saleSnap.exists()) {
+      throw new Error(`Sale ${saleId} was not found.`);
+    }
+
+    const saleData = toSale(saleSnap.id, saleSnap.data());
+    const inventoryReads: Array<{
+      item: SaleItem;
+      ref: ReturnType<typeof doc>;
+      currentQuantity: number;
+    }> = [];
+    const assignmentReads: Array<{
+      item: SaleItem;
+      ref: ReturnType<typeof doc>;
+      assignedQuantity: number;
+      soldQuantity: number;
+      exists: boolean;
+    }> = [];
+
+    if (restoreStock) {
+      for (const item of saleData.items) {
+        const invRef = doc(db, INVENTORY_COLLECTION, getInventoryDocId(saleData.storeId, item.productId));
+        const invSnap = await transaction.get(invRef);
+        inventoryReads.push({
+          item,
+          ref: invRef,
+          currentQuantity: invSnap.exists() ? Number(invSnap.data().quantity || 0) : 0
+        });
+
+        const assignmentDate = normalizeDateString(saleData.createdAt);
+        const assignmentRef = doc(
+          db,
+          ASSIGNMENTS_COLLECTION,
+          getAssignmentDocId(assignmentDate, saleData.storeId, item.productId)
+        );
+        const assignmentSnap = await transaction.get(assignmentRef);
+        assignmentReads.push({
+          item,
+          ref: assignmentRef,
+          assignedQuantity: assignmentSnap.exists() ? Number(assignmentSnap.data().assignedQuantity || 0) : 0,
+          soldQuantity: assignmentSnap.exists() ? Number(assignmentSnap.data().soldQuantity || 0) : 0,
+          exists: assignmentSnap.exists()
+        });
+      }
+    }
+
+    transaction.set(
+      saleRef,
+      {
         status: 'CANCELLED',
         cancellationReason: reason,
         cancelledBy: adminUser.fullName,
-        cancelledAt: now
-      });
+        cancelledAt: now,
+        updatedAtServer: serverTimestamp()
+      },
+      { merge: true }
+    );
 
-      if (restoreStock && saleData.items) {
-        for (const item of saleData.items) {
-          const invDocId = getInventoryDocId(saleData.storeId, item.productId);
-          const invRef = doc(db, INVENTORY_COLLECTION, invDocId);
-          const invSnap = await getDoc(invRef);
-          if (invSnap.exists()) {
-            const current = invSnap.data().quantity || 0;
-            await updateDoc(invRef, {
-              quantity: current + item.quantity,
-              updatedAt: now
-            });
-          }
-        }
-      }
-
-      await logAudit(
-        adminUser.id,
-        adminUser.fullName,
-        adminUser.role,
-        'SALE_CANCELLED',
-        'Sales',
-        `Cancelled Invoice #${saleData.invoiceNumber} (${saleData.storeName}) for ₹${saleData.grandTotal}. Reason: ${reason}`,
+    inventoryReads.forEach(({ item, ref, currentQuantity }) => {
+      transaction.set(
+        ref,
         {
-          entityId: saleId,
-          storeId: saleData.storeId,
-          storeName: saleData.storeName,
-          oldValue: 'COMPLETED',
-          newValue: 'CANCELLED'
-        }
+          quantity: currentQuantity + item.quantity,
+          updatedAt: now,
+          updatedAtServer: serverTimestamp()
+        },
+        { merge: true }
       );
-    }
-  } catch (err) {
-    console.warn('Firestore cancelSale notice, updating local cache:', err);
-  }
+    });
 
-  const sales = getLocalData<Sale[]>(SALES_COLLECTION, INITIAL_SALES);
-  const updated = sales.map((s) => (s.id === saleId ? { ...s, status: 'CANCELLED' as const } : s));
-  setLocalData(SALES_COLLECTION, updated);
+    assignmentReads.forEach(({ item, ref, assignedQuantity, soldQuantity, exists }) => {
+      if (!exists) return;
+      const newSold = Math.max(0, soldQuantity - item.quantity);
+      transaction.set(
+        ref,
+        {
+          soldQuantity: newSold,
+          remainingQuantity: Math.max(0, assignedQuantity - newSold),
+          updatedAt: now,
+          updatedAtServer: serverTimestamp()
+        },
+        { merge: true }
+      );
+    });
+
+    return saleData;
+  });
+
   try {
-    window.dispatchEvent(new CustomEvent('raraju_sales_updated'));
-  } catch (e) {}
+    await logAudit(
+      adminUser.id,
+      adminUser.fullName,
+      adminUser.role,
+      'SALE_CANCELLED',
+      'Sales',
+      `Cancelled Invoice #${saleData.invoiceNumber} (${saleData.storeName}) for ₹${saleData.grandTotal}. Reason: ${reason}`,
+      {
+        entityId: saleId,
+        storeId: saleData.storeId,
+        storeName: saleData.storeName,
+        oldValue: 'COMPLETED',
+        newValue: 'CANCELLED'
+      }
+    );
+  } catch (err) {
+    console.warn('Firestore cancelSale audit notice:', err);
+  }
 };
 
 export const deleteSale = async (
@@ -581,52 +508,103 @@ export const deleteSale = async (
   adminUser: UserProfile,
   restoreStock = true
 ): Promise<void> => {
-  try {
+  const now = new Date().toISOString();
+
+  const saleData = await runTransaction(db, async (transaction): Promise<Sale> => {
     const saleRef = doc(db, SALES_COLLECTION, saleId);
-    const saleSnap = await getDoc(saleRef);
-    if (saleSnap.exists()) {
-      const saleData = saleSnap.data() as Sale;
-
-      if (restoreStock && saleData.items) {
-        for (const item of saleData.items) {
-          const invDocId = getInventoryDocId(saleData.storeId, item.productId);
-          const invRef = doc(db, INVENTORY_COLLECTION, invDocId);
-          const invSnap = await getDoc(invRef);
-          if (invSnap.exists()) {
-            const current = invSnap.data().quantity || 0;
-            await updateDoc(invRef, {
-              quantity: current + item.quantity,
-              updatedAt: new Date().toISOString()
-            });
-          }
-        }
-      }
-
-      await deleteDoc(saleRef);
-
-      await logAudit(
-        adminUser.id,
-        adminUser.fullName,
-        adminUser.role,
-        'SALE_DELETED',
-        'Sales',
-        `Permanently Deleted Invoice #${saleData.invoiceNumber} (${saleData.storeName}) for ₹${saleData.grandTotal}`,
-        {
-          entityId: saleId,
-          storeId: saleData.storeId,
-          storeName: saleData.storeName,
-          oldValue: saleData
-        }
-      );
+    const saleSnap = await transaction.get(saleRef);
+    if (!saleSnap.exists()) {
+      throw new Error(`Sale ${saleId} was not found.`);
     }
-  } catch (err) {
-    console.warn('Firestore deleteSale notice, updating local cache:', err);
-  }
 
-  const sales = getLocalData<Sale[]>(SALES_COLLECTION, INITIAL_SALES);
-  const updated = sales.filter((s) => s.id !== saleId);
-  setLocalData(SALES_COLLECTION, updated);
+    const saleData = toSale(saleSnap.id, saleSnap.data());
+    const inventoryReads: Array<{
+      item: SaleItem;
+      ref: ReturnType<typeof doc>;
+      currentQuantity: number;
+    }> = [];
+    const assignmentReads: Array<{
+      item: SaleItem;
+      ref: ReturnType<typeof doc>;
+      assignedQuantity: number;
+      soldQuantity: number;
+      exists: boolean;
+    }> = [];
+
+    if (restoreStock) {
+      for (const item of saleData.items) {
+        const invRef = doc(db, INVENTORY_COLLECTION, getInventoryDocId(saleData.storeId, item.productId));
+        const invSnap = await transaction.get(invRef);
+        inventoryReads.push({
+          item,
+          ref: invRef,
+          currentQuantity: invSnap.exists() ? Number(invSnap.data().quantity || 0) : 0
+        });
+
+        const assignmentDate = normalizeDateString(saleData.createdAt);
+        const assignmentRef = doc(
+          db,
+          ASSIGNMENTS_COLLECTION,
+          getAssignmentDocId(assignmentDate, saleData.storeId, item.productId)
+        );
+        const assignmentSnap = await transaction.get(assignmentRef);
+        assignmentReads.push({
+          item,
+          ref: assignmentRef,
+          assignedQuantity: assignmentSnap.exists() ? Number(assignmentSnap.data().assignedQuantity || 0) : 0,
+          soldQuantity: assignmentSnap.exists() ? Number(assignmentSnap.data().soldQuantity || 0) : 0,
+          exists: assignmentSnap.exists()
+        });
+      }
+    }
+
+    inventoryReads.forEach(({ item, ref, currentQuantity }) => {
+      transaction.set(
+        ref,
+        {
+          quantity: currentQuantity + item.quantity,
+          updatedAt: now,
+          updatedAtServer: serverTimestamp()
+        },
+        { merge: true }
+      );
+    });
+
+    assignmentReads.forEach(({ item, ref, assignedQuantity, soldQuantity, exists }) => {
+      if (!exists) return;
+      const newSold = Math.max(0, soldQuantity - item.quantity);
+      transaction.set(
+        ref,
+        {
+          soldQuantity: newSold,
+          remainingQuantity: Math.max(0, assignedQuantity - newSold),
+          updatedAt: now,
+          updatedAtServer: serverTimestamp()
+        },
+        { merge: true }
+      );
+    });
+
+    transaction.delete(saleRef);
+    return saleData;
+  });
+
   try {
-    window.dispatchEvent(new CustomEvent('raraju_sales_updated'));
-  } catch (e) {}
+    await logAudit(
+      adminUser.id,
+      adminUser.fullName,
+      adminUser.role,
+      'SALE_DELETED',
+      'Sales',
+      `Permanently Deleted Invoice #${saleData.invoiceNumber} (${saleData.storeName}) for ₹${saleData.grandTotal}`,
+      {
+        entityId: saleId,
+        storeId: saleData.storeId,
+        storeName: saleData.storeName,
+        oldValue: saleData
+      }
+    );
+  } catch (err) {
+    console.warn('Firestore deleteSale audit notice:', err);
+  }
 };

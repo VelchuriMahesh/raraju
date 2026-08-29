@@ -9,24 +9,108 @@ import { auth, db } from './firebase';
 import { UserProfile, UserRole } from '../types/auth';
 import { getUserById, getUserByEmail, createUserProfile } from './userService';
 import { logAudit } from './auditService';
-import { doc, getDoc } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, query, setDoc, where } from 'firebase/firestore';
 import { Store } from '../types/store';
-import { getLocalData } from './fallbackData';
 
-/**
- * Resolves store details by login email instantly from cache
- */
-const findStoreByEmail = (cleanEmail: string): Store | null => {
-  const localStores = getLocalData<Store[]>('stores', []);
-  if (localStores.length === 1) return localStores[0]; // If 1 store exists (krupa), associate immediately
-  return (
-    localStores.find(
-      (s) =>
-        s.loginEmail?.toLowerCase() === cleanEmail ||
-        s.email?.toLowerCase() === cleanEmail ||
-        cleanEmail.startsWith(s.name.toLowerCase().replace(/\s+/g, ''))
-    ) || localStores[0] || null
+const STORES_COLLECTION = 'stores';
+const USERS_COLLECTION = 'users';
+const DEFAULT_STORE_ID = 'S1';
+const DEFAULT_STORE_NAME = 'krupa';
+
+interface CanonicalStoreAssignment {
+  id: string;
+  name: string;
+  code: string;
+}
+
+const storeToAssignment = (store: Store): CanonicalStoreAssignment => ({
+  id: store.code || store.id,
+  name: store.name || DEFAULT_STORE_NAME,
+  code: store.code || store.id || DEFAULT_STORE_ID
+});
+
+const resolveStoreAssignment = async (
+  cleanEmail: string,
+  currentStoreId?: string | null
+): Promise<CanonicalStoreAssignment> => {
+  if (currentStoreId) {
+    const byCodeSnap = await getDocs(query(collection(db, STORES_COLLECTION), where('code', '==', currentStoreId)));
+    if (!byCodeSnap.empty) {
+      return storeToAssignment({ id: byCodeSnap.docs[0].id, ...byCodeSnap.docs[0].data() } as Store);
+    }
+
+    const byDocIdSnap = await getDoc(doc(db, STORES_COLLECTION, currentStoreId));
+    if (byDocIdSnap.exists()) {
+      return storeToAssignment({ id: byDocIdSnap.id, ...byDocIdSnap.data() } as Store);
+    }
+  }
+
+  const byLoginEmailSnap = await getDocs(
+    query(collection(db, STORES_COLLECTION), where('loginEmail', '==', cleanEmail))
   );
+  if (!byLoginEmailSnap.empty) {
+    return storeToAssignment({ id: byLoginEmailSnap.docs[0].id, ...byLoginEmailSnap.docs[0].data() } as Store);
+  }
+
+  const byEmailSnap = await getDocs(query(collection(db, STORES_COLLECTION), where('email', '==', cleanEmail)));
+  if (!byEmailSnap.empty) {
+    return storeToAssignment({ id: byEmailSnap.docs[0].id, ...byEmailSnap.docs[0].data() } as Store);
+  }
+
+  return {
+    id: DEFAULT_STORE_ID,
+    name: DEFAULT_STORE_NAME,
+    code: DEFAULT_STORE_ID
+  };
+};
+
+const persistAuthUidProfile = async (
+  authUid: string,
+  profile: UserProfile,
+  previousProfileId?: string
+): Promise<UserProfile> => {
+  const now = new Date().toISOString();
+  const canonicalProfile: UserProfile = {
+    ...profile,
+    id: authUid,
+    updatedAt: now
+  };
+
+  await setDoc(doc(db, USERS_COLLECTION, authUid), canonicalProfile, { merge: true });
+  if (previousProfileId && previousProfileId !== authUid) {
+    await setDoc(
+      doc(db, USERS_COLLECTION, previousProfileId),
+      {
+        ...profile,
+        storeId: canonicalProfile.storeId,
+        storeName: canonicalProfile.storeName,
+        updatedAt: now
+      },
+      { merge: true }
+    );
+  }
+
+  return canonicalProfile;
+};
+
+const normalizeStoreStaffProfile = async (
+  profile: UserProfile,
+  cleanEmail: string,
+  authUid: string
+): Promise<UserProfile> => {
+  if (profile.role === 'SUPER_ADMIN') return profile;
+
+  const assignedStore = await resolveStoreAssignment(cleanEmail, profile.storeId);
+  const previousProfileId = profile.id;
+  const normalized: UserProfile = {
+    ...profile,
+    storeId: assignedStore.id,
+    storeName: assignedStore.name,
+    employeeId: profile.employeeId || `EMP-${assignedStore.code}-01`,
+    status: 'ACTIVE'
+  };
+
+  return persistAuthUidProfile(authUid, normalized, previousProfileId);
 };
 
 export const loginUser = async (email: string, password: string): Promise<UserProfile> => {
@@ -71,9 +155,6 @@ export const loginUser = async (email: string, password: string): Promise<UserPr
       }
     }
 
-    // Lookup matching store for cashier
-    const assignedStore = !isAdminEmail ? findStoreByEmail(cleanEmail) : null;
-
     // Retrieve or construct User Profile
     let profile: UserProfile | null = null;
     try {
@@ -87,14 +168,15 @@ export const loginUser = async (email: string, password: string): Promise<UserPr
 
     if (!profile) {
       const role: UserRole = isAdminEmail ? 'SUPER_ADMIN' : 'STORE_STAFF';
-      const storeId = assignedStore?.id || 's1';
-      const storeName = assignedStore?.name || 'krupa';
+      const assignedStore = isAdminEmail ? null : await resolveStoreAssignment(cleanEmail);
+      const storeId = assignedStore?.id;
+      const storeName = assignedStore?.name;
       const fullName = isAdminEmail
         ? 'RARAJU Admin'
-        : `${storeName} Cashier`;
+        : `${storeName || DEFAULT_STORE_NAME} Cashier`;
       const employeeId = isAdminEmail
         ? 'EMP-ADM-01'
-        : `EMP-${assignedStore?.code || 'S1'}-01`;
+        : `EMP-${assignedStore?.code || DEFAULT_STORE_ID}-01`;
 
       profile = {
         id: uid || `user_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`,
@@ -113,11 +195,8 @@ export const loginUser = async (email: string, password: string): Promise<UserPr
         await createUserProfile(profile.id, profile);
       } catch (saveErr) {}
     } else {
-      if (assignedStore) {
-        profile.storeId = assignedStore.id;
-        profile.storeName = assignedStore.name;
-        profile.employeeId = `EMP-${assignedStore.code || 'S1'}-01`;
-        profile.fullName = `${assignedStore.name} Cashier`;
+      if (!isAdminEmail && uid) {
+        profile = await normalizeStoreStaffProfile(profile, cleanEmail, uid);
       }
     }
 
@@ -126,6 +205,9 @@ export const loginUser = async (email: string, password: string): Promise<UserPr
       profile.status = 'ACTIVE';
       profile.storeId = undefined;
       profile.storeName = undefined;
+      if (uid) {
+        await persistAuthUidProfile(uid, profile, profile.id);
+      }
     }
 
     if (profile.status === 'INACTIVE') {
@@ -222,18 +304,14 @@ export const subscribeToAuthChanges = (
       email.includes('admin') ||
       email.includes('raraju');
 
-    const assignedStore = !isAdmin ? findStoreByEmail(email) : null;
-    const storeId = assignedStore?.id || 's1';
-    const storeName = assignedStore?.name || 'krupa';
-
     const fallbackProfile: UserProfile = {
       id: firebaseUser.uid,
       email,
-      fullName: isAdmin ? 'RARAJU Admin' : `${storeName} Cashier`,
+      fullName: isAdmin ? 'RARAJU Admin' : `${DEFAULT_STORE_NAME} Cashier`,
       role: isAdmin ? 'SUPER_ADMIN' : 'STORE_STAFF',
-      storeId: isAdmin ? undefined : storeId,
-      storeName: isAdmin ? undefined : storeName,
-      employeeId: isAdmin ? 'EMP-ADM-01' : `EMP-${assignedStore?.code || 'S1'}-01`,
+      storeId: isAdmin ? undefined : DEFAULT_STORE_ID,
+      storeName: isAdmin ? undefined : DEFAULT_STORE_NAME,
+      employeeId: isAdmin ? 'EMP-ADM-01' : `EMP-${DEFAULT_STORE_ID}-01`,
       status: 'ACTIVE',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
@@ -243,18 +321,18 @@ export const subscribeToAuthChanges = (
     callback(fallbackProfile);
 
     // Background profile refresh from Firestore
-    getUserById(firebaseUser.uid)
-      .then((profile) => {
+    Promise.all([getUserById(firebaseUser.uid), getUserByEmail(email)])
+      .then(async ([profileById, profileByEmail]) => {
+        let profile = profileById || profileByEmail;
         if (profile) {
           if (isAdmin) {
             profile.role = 'SUPER_ADMIN';
             profile.status = 'ACTIVE';
             profile.storeId = undefined;
             profile.storeName = undefined;
+            profile = await persistAuthUidProfile(firebaseUser.uid, profile, profile.id);
           } else {
-            profile.storeId = storeId;
-            profile.storeName = storeName;
-            profile.fullName = `${storeName} Cashier`;
+            profile = await normalizeStoreStaffProfile(profile, email, firebaseUser.uid);
           }
           callback(profile);
         }

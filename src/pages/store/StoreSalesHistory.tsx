@@ -32,13 +32,13 @@ export const StoreSalesHistory: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [viewingSale, setViewingSale] = useState<Sale | null>(null);
 
-  const storeId = currentUser?.storeId || 's1';
+  const storeId = currentUser?.storeId || '';
 
   useEffect(() => {
     const unsub = subscribeToSales((liveSales) => {
       setSales(liveSales);
       setLoading(false);
-    });
+    }, storeId || undefined);
 
     return () => unsub();
   }, [storeId]);
@@ -47,12 +47,7 @@ export const StoreSalesHistory: React.FC = () => {
   const dailySales = useMemo(() => {
     return sales.filter((s) => {
       const matchesDate = !selectedDate || s.createdAt.includes(selectedDate) || s.createdAt.startsWith(selectedDate);
-      const matchesStore =
-        !storeId ||
-        s.storeId === storeId ||
-        s.storeName.toLowerCase() === (currentUser?.storeName || 'krupa').toLowerCase() ||
-        s.storeId === 's1' ||
-        s.storeId === 'store_1_main';
+      const matchesStore = !storeId || s.storeId === storeId;
 
       const q = searchQuery.toLowerCase().trim();
       const matchesSearch =

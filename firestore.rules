@@ -2,9 +2,13 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helper functions for security and role checks
     function isAuthenticated() {
       return request.auth != null;
+    }
+
+    function userDocExists() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
     }
 
     function getUserData() {
@@ -13,100 +17,205 @@ service cloud.firestore {
 
     function isAdmin() {
       return isAuthenticated() && (
-        request.auth.token.email == 'raraju@gmail.com' ||
-        request.auth.token.email == 'admin@raraju.com' ||
-        getUserData().role == 'SUPER_ADMIN'
+        request.auth.token.email in ['raraju@gmail.com', 'admin@raraju.com'] ||
+        (userDocExists() && getUserData().role == 'SUPER_ADMIN')
       );
     }
 
-    // 1. Users Collection
+    function isStoreStaff() {
+      return userDocExists() && getUserData().role == 'STORE_STAFF';
+    }
+
+    function userStoreId() {
+      return getUserData().storeId;
+    }
+
+    function canAccessStore(storeId) {
+      return isAdmin() || (isStoreStaff() && userStoreId() == storeId);
+    }
+
+    function validStoreScopedCreate() {
+      return request.resource.data.storeId is string &&
+        canAccessStore(request.resource.data.storeId);
+    }
+
+    function validStoreScopedRead() {
+      return resource.data.storeId is string &&
+        canAccessStore(resource.data.storeId);
+    }
+
+    function validNonNegativeQuantity() {
+      return request.resource.data.quantity is number &&
+        request.resource.data.quantity >= 0;
+    }
+
     match /users/{userId} {
-      allow read, write: if true;
+      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
+      allow create: if isAdmin() ||
+        (
+          isAuthenticated() &&
+          request.auth.uid == userId &&
+          request.resource.data.role == 'STORE_STAFF' &&
+          request.resource.data.storeId is string
+        );
+      allow update: if isAdmin() ||
+        (
+          isAuthenticated() &&
+          request.auth.uid == userId &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.storeId == resource.data.storeId
+        );
+      allow delete: if isAdmin();
     }
 
-    // 2. Stores Collection (krupa, S1, etc.)
     match /stores/{storeId} {
-      allow read, write: if true;
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
     }
 
-    // 3. Products Catalog
     match /products/{productId} {
-      allow read, write: if true;
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
     }
 
-    // 4. Product Categories
     match /categories/{categoryId} {
-      allow read, write: if true;
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
     }
 
-    // 5. Daily Stock Assignments
     match /dailyStockAssignments/{assignmentId} {
-      allow read, write: if true;
+      allow read: if validStoreScopedRead();
+      allow create: if isAdmin() &&
+        request.resource.data.storeId is string &&
+        request.resource.data.productId is string &&
+        request.resource.data.date is string &&
+        request.resource.data.assignedQuantity is number &&
+        request.resource.data.assignedQuantity >= 0 &&
+        request.resource.data.remainingQuantity is number &&
+        request.resource.data.remainingQuantity >= 0;
+      allow update: if isAdmin() ||
+        (
+          isStoreStaff() &&
+          resource.data.storeId == userStoreId() &&
+          request.resource.data.storeId == resource.data.storeId &&
+          request.resource.data.productId == resource.data.productId &&
+          request.resource.data.date == resource.data.date &&
+          request.resource.data.assignedQuantity == resource.data.assignedQuantity &&
+          request.resource.data.soldQuantity is number &&
+          request.resource.data.soldQuantity >= resource.data.soldQuantity &&
+          request.resource.data.remainingQuantity is number &&
+          request.resource.data.remainingQuantity >= 0
+        );
+      allow delete: if isAdmin();
     }
 
-    // 6. Store Inventory
     match /inventory/{inventoryId} {
-      allow read, write: if true;
+      allow read: if validStoreScopedRead();
+      allow create: if isAdmin() &&
+        request.resource.data.storeId is string &&
+        request.resource.data.productId is string &&
+        validNonNegativeQuantity();
+      allow update: if isAdmin() ||
+        (
+          isStoreStaff() &&
+          resource.data.storeId == userStoreId() &&
+          request.resource.data.storeId == resource.data.storeId &&
+          request.resource.data.productId == resource.data.productId &&
+          validNonNegativeQuantity()
+        );
+      allow delete: if isAdmin();
     }
 
-    // 7. Stock Movements (IN, OUT, SALE, ADJUSTMENT, RETURN)
     match /stockMovements/{movementId} {
-      allow read, write: if true;
+      allow read: if validStoreScopedRead();
+      allow create: if validStoreScopedCreate();
+      allow update, delete: if isAdmin();
     }
 
-    // 8. Stock Transfers (Store-to-Store)
     match /stockTransfers/{transferId} {
-      allow read, write: if true;
+      allow read, create, update, delete: if isAdmin();
     }
 
-    // 9. Sales & Invoices
     match /sales/{saleId} {
-      allow read, write: if true;
+      allow read: if validStoreScopedRead();
+      allow create: if validStoreScopedCreate();
+      allow update, delete: if isAdmin();
     }
 
-    // 10. Daily Closings (Day End Register Closing)
     match /dailyClosings/{closingId} {
-      allow read, write: if true;
+      allow read: if validStoreScopedRead();
+      allow create: if validStoreScopedCreate();
+      allow update: if isAdmin() ||
+        (
+          isStoreStaff() &&
+          resource.data.storeId == userStoreId() &&
+          request.resource.data.storeId == resource.data.storeId
+        );
+      allow delete: if isAdmin();
     }
 
-    // 11. Store Expenses
     match /expenses/{expenseId} {
-      allow read, write: if true;
+      allow read: if isAdmin() || validStoreScopedRead();
+      allow create: if isAdmin() || validStoreScopedCreate();
+      allow update, delete: if isAdmin();
     }
 
-    // 12. Supplier Purchases / Inward Stock
     match /purchases/{purchaseId} {
-      allow read, write: if true;
+      allow read, create, update, delete: if isAdmin();
     }
 
-    // 13. Customers & Credit Balances
     match /customers/{customerId} {
-      allow read, write: if true;
+      allow read, create, update: if isAuthenticated();
+      allow delete: if isAdmin();
     }
 
-    // 14. Business Settings & Thermal Invoice Config
     match /settings/{settingId} {
-      allow read, write: if true;
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
     }
 
-    // 15. Audit Logs
     match /auditLogs/{logId} {
-      allow read, write: if true;
+      allow read: if isAdmin();
+      allow create: if isAuthenticated();
+      allow update, delete: if false;
     }
 
-    // 16. Notifications & Low Stock Alerts
     match /notifications/{notifId} {
-      allow read, write: if true;
+      allow read: if isAdmin() ||
+        (
+          isStoreStaff() &&
+          (
+            !('storeId' in resource.data) ||
+            resource.data.storeId == userStoreId()
+          )
+        );
+      allow create: if isAuthenticated();
+      allow update: if isAdmin() ||
+        (
+          isStoreStaff() &&
+          (
+            !('storeId' in resource.data) ||
+            resource.data.storeId == userStoreId()
+          )
+        );
+      allow delete: if isAdmin();
     }
 
-    // 17. Atomic Invoice / Bill Number Counters
     match /counters/{counterId} {
-      allow read, write: if true;
+      allow read, create, update: if isAdmin() ||
+        (
+          isStoreStaff() &&
+          counterId == 'invoice_' + userStoreId()
+        );
+      allow delete: if isAdmin();
     }
 
-    // Global Catch-all for any nested subcollections
+    match /reconciliations/{reconciliationId} {
+      allow read, create, update, delete: if isAdmin();
+    }
+
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
   }
 }

@@ -56,11 +56,13 @@ export const StockAssignment: React.FC = () => {
   const [historyStoreFilter, setHistoryStoreFilter] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
+  const getCanonicalStoreId = (store: Store) => store.code || store.id;
+
   useEffect(() => {
     const unsubStores = subscribeToStores((liveStores) => {
       setStores(liveStores);
       if (!selectedStoreId && liveStores.length > 0) {
-        setSelectedStoreId(liveStores[0].id);
+        setSelectedStoreId(getCanonicalStoreId(liveStores[0]));
       }
     });
 
@@ -104,7 +106,7 @@ export const StockAssignment: React.FC = () => {
     );
     const updated: { [id: string]: string } = {};
     products.forEach((p) => {
-      const found = existing.find((a) => a.productId === p.id || (a.sku && p.sku && a.sku === p.sku));
+      const found = existing.find((a) => a.productId === p.id);
       updated[p.id] = found ? String(found.assignedQuantity) : '0';
     });
     setStockInputs(updated);
@@ -121,7 +123,7 @@ export const StockAssignment: React.FC = () => {
     e.preventDefault();
     if (!currentUser || !selectedStoreId) return;
 
-    const targetStore = stores.find((s) => s.id === selectedStoreId);
+    const targetStore = stores.find((s) => getCanonicalStoreId(s) === selectedStoreId);
     if (!targetStore) {
       error('Invalid store selection');
       return;
@@ -135,7 +137,7 @@ export const StockAssignment: React.FC = () => {
         if (!isNaN(qty) && qty >= 0) {
           await assignDailyStock(
             assignmentDate,
-            targetStore.id,
+            selectedStoreId,
             targetStore.name,
             targetStore.code,
             prod.id,
@@ -302,7 +304,7 @@ export const StockAssignment: React.FC = () => {
                 className="px-3 py-1.5 bg-white border border-slate-300 rounded-xl font-bold text-slate-900 shadow-sm focus:outline-none focus:border-indigo-500"
               >
                 {stores.map((s) => (
-                  <option key={s.id} value={s.id}>
+                  <option key={s.id} value={getCanonicalStoreId(s)}>
                     {s.name} ({s.code})
                   </option>
                 ))}
@@ -432,7 +434,7 @@ export const StockAssignment: React.FC = () => {
               >
                 <option value="ALL">All Stores</option>
                 {stores.map((s) => (
-                  <option key={s.id} value={s.id}>
+                  <option key={s.id} value={getCanonicalStoreId(s)}>
                     {s.name}
                   </option>
                 ))}
