@@ -394,7 +394,11 @@ export const POS: React.FC = () => {
         })
       );
 
-      success(`Sale completed successfully! Invoice #${sale.invoiceNumber}`);
+      if ((sale as any)?._cloudSyncWarning) {
+        warning(`Sale saved locally as #${sale.invoiceNumber}. Note: Cloud sync pending (${(sale as any)._cloudSyncWarning}).`);
+      } else {
+        success(`Sale completed successfully! Invoice #${sale.invoiceNumber}`);
+      }
     } catch (err: any) {
       console.error('Checkout error:', err);
       error(err.message || 'Failed to complete sale transaction.');

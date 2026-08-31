@@ -72,15 +72,16 @@ export const translations: Translations = {
   // Payment
   paymentAndCheckout: { en: 'Payment & Checkout', te: 'చెల్లింపు & చెక్‌అవుట్' },
   selectPaymentMethod: { en: 'Select Payment Method', te: 'చెల్లింపు విధానాన్ని ఎంచుకోండి' },
-  cash: { en: 'Cash', te: 'నగదు (Cash)' },
+  cash: { en: 'Cash', te: 'నగదు' },
   upi: { en: 'UPI / QR', te: 'యూపీఐ / క్యూఆర్' },
-  card: { en: 'Card', te: 'కార్డు (Card)' },
-  credit: { en: 'Store Credit', te: 'అరువు / క్రెడిట్' },
+  card: { en: 'Card', te: 'కార్డు' },
+  credit: { en: 'Store Credit', te: 'అరువు' },
   split: { en: 'Split Pay', te: 'స్ప్లిట్ చెల్లింపు' },
   cashTendered: { en: 'Cash Tendered / Received', te: 'స్వీకరించిన నగదు' },
   changeDue: { en: 'Change Due to Customer', te: 'కస్టమర్‌కు ఇవ్వాల్సిన చిల్లర' },
   customerName: { en: 'Customer Name', te: 'కస్టమర్ పేరు' },
   customerPhone: { en: 'WhatsApp Mobile', te: 'వాట్సాప్ మొబైల్' },
+  completePayment: { en: 'Complete Payment', te: 'చెల్లింపు పూర్తి చేయండి' },
 
   // Post Sale / Invoice
   saleCompleted: { en: 'SALE COMPLETED!', te: 'సేల్ విజయవంతంగా పూర్తయింది!' },

@@ -400,11 +400,9 @@ export const completeSaleTransaction = async (
     } catch (notifErr) {}
   }
 
-  if (cloudSaleError) {
-    throw new Error(
-      `Bill ${completedSale?.invoiceNumber} was NOT saved to the cloud and will not appear in admin reports ` +
-        `(${cloudSaleError.code || 'error'}: ${cloudSaleError.message || cloudSaleError}).`
-    );
+  if (cloudSaleError && completedSale) {
+    (completedSale as any)._cloudSyncWarning = cloudSaleError.code || cloudSaleError.message || 'permission-denied';
+    console.warn(`[SALE CLOUD SYNC NOTICE] Bill ${completedSale.invoiceNumber} saved locally:`, cloudSaleError);
   }
 
   return completedSale!;

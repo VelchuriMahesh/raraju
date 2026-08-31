@@ -65,10 +65,10 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
   }, []);
 
   const paymentModes = [
-    { id: 'CASH', label: t('cash'), icon: Banknote },
-    { id: 'UPI', label: t('upi'), icon: QrCode },
-    { id: 'CARD', label: t('card'), icon: CreditCard },
-    { id: 'CREDIT', label: t('credit'), icon: UserCheck }
+    { id: 'CASH', en: 'Cash', te: 'నగదు', icon: Banknote },
+    { id: 'UPI', en: 'UPI / QR', te: 'యూపీఐ', icon: QrCode },
+    { id: 'CARD', en: 'Card', te: 'కార్డు', icon: CreditCard },
+    { id: 'CREDIT', en: 'Store Credit', te: 'అరువు', icon: UserCheck }
   ];
 
   const handleMethodSelect = (m: PaymentMethod) => {
@@ -136,10 +136,10 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-fade-in">
       <div className="bg-white border border-slate-200 rounded-3xl max-w-lg w-full p-6 shadow-2xl text-slate-800 max-h-[90vh] overflow-y-auto custom-scrollbar animate-scale-up">
         {/* Header */}
-        <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+        <div className="flex items-center justify-between pb-4 border-b border-slate-100 pt-1">
           <div>
-            <h3 className="font-black text-xl text-slate-900">{t('paymentAndCheckout')}</h3>
-            <p className="text-xs text-slate-500">{t('selectPaymentMethod')}</p>
+            <h3 className="font-black text-xl text-slate-900 leading-snug">{t('paymentAndCheckout')}</h3>
+            <p className="text-xs text-slate-500 mt-0.5">{t('selectPaymentMethod')}</p>
           </div>
           <button
             onClick={onClose}
@@ -178,14 +178,21 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({
                   key={pm.id}
                   type="button"
                   onClick={() => handleMethodSelect(pm.id as PaymentMethod)}
-                  className={`flex flex-col items-center justify-center p-3 rounded-2xl border text-xs font-bold transition-all ${
+                  className={`flex flex-col items-center justify-center py-2.5 px-2 rounded-2xl border text-center transition-all min-h-[72px] ${
                     isSelected
                       ? 'bg-indigo-600 border-indigo-600 text-white shadow-lg shadow-indigo-600/20 scale-[1.02]'
-                      : 'bg-slate-50 border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                      : 'bg-slate-50 border-slate-200 text-slate-700 hover:text-slate-900 hover:bg-slate-100'
                   }`}
                 >
-                  <Icon className="w-5 h-5 mb-1.5" />
-                  <span className="truncate text-center">{pm.label}</span>
+                  <Icon className={`w-5 h-5 mb-1 ${isSelected ? 'text-white' : 'text-indigo-600'}`} />
+                  <span className="text-xs font-bold leading-tight line-clamp-1">
+                    {language === 'te' ? pm.te : pm.en}
+                  </span>
+                  {language === 'dual' && (
+                    <span className={`text-[10px] leading-tight mt-0.5 font-medium line-clamp-1 ${isSelected ? 'text-indigo-100' : 'text-slate-500'}`}>
+                      {pm.te}
+                    </span>
+                  )}
                 </button>
               );
             })}
